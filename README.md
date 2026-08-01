@@ -8,7 +8,7 @@
 ## 一行命令安装
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/<USER>/<REPO>/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/xkxxs/codex-termux/main/install.sh)
 ```
 
 ## 脚本做了什么
@@ -61,7 +61,7 @@ bash <(curl -fsSL https://cdn.deepseek.com/api-docs/codex-deepseek-setup.sh)
 ## 卸载
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/<USER>/<REPO>/main/install.sh) --uninstall
+bash <(curl -fsSL https://raw.githubusercontent.com/xkxxs/codex-termux/main/install.sh) --uninstall
 # 如需删除配置: rm -rf ~/.codex
 ```
 
