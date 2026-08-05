@@ -1,9 +1,23 @@
 # codex-termux
 
-在 Termux (Android ARM64) 上一键安装**官方** Codex CLI 最新版。
+在 Termux (Android ARM64) 上一键安装**官方** Codex CLI 最新版，**无需 proot、无需安装 Ubuntu 等完整 Linux 系统**。
 
-> 不用社区适配包（停更/假升级循环），直接用 OpenAI 官方 musl 静态二进制，
-> 只是手动绕过 npm 的 `os: linux` 平台检查。
+> 直接运行 OpenAI 官方 musl 静态二进制（逐字节原样，零修改），
+> 只是手动绕过 npm 的 `os: linux` 平台检查。不用社区适配包、不用虚拟机。
+
+## 为什么选这个方案？
+
+**在其他 Android 上跑 codex，主流路线是 proot-distro 装个 Ubuntu**——完整系统环境，听起来稳妥，但代价巨大：
+
+| 对比项 | **本方案（原生直跑）** | proot + Ubuntu | 社区 fork 编译的 npm 包 | 二进制打补丁脚本 |
+|---|---|---|---|---|
+| 系统环境 | ✅ 只需 Termux 本体 | ❌ 额外装 ~5GB Ubuntu | ✅ 只需 Termux | ✅ 只需 Termux |
+| 运行方式 | ✅ 官方二进制**零修改** | proot 转译，性能损耗 ~30% | 非官方源码 fork 重编译 | 需对二进制打补丁，更新后重打 |
+| 上游同步 | ✅ 官方发布即用，永远最新 | ✅ 但 **codex ≥0.43 直接崩溃**（[#6757](https://github.com/openai/codex/issues/6757)：`prctl(PR_SET_DUMPABLE, 0) failed`，只能钉 0.42） | ⚠️ 慢半拍，维护者停更即死路 | ⚠️ 上游每更一次都要重 patch |
+| 存储占用 | ✅ 几十 MB | ❌ ~5GB+ | ✅ | ✅ |
+| 稳定性 | ✅ 官方二进制 + wrapper 防假升级 | ❌ proot 边界情况多 | ⚠️ 依赖第三方维护 | ⚠️ 依赖 patch 脚本维护 |
+
+**一句话**：手机上跑 codex 不需要一台"完整的 Ubuntu"——codex 官方本来就发布 musl 静态二进制，把它从 npm 里"请"出来直接跑就行。本方案是唯一一个**官方二进制 + 原生直跑 + 零修改**的组合。
 
 ## 一行命令安装
 
