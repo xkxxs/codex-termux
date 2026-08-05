@@ -58,6 +58,52 @@ install_dependencies() {
     fi
 }
 
+# ---------- 镜像源适配 ----------
+# 刚装的 Termux 默认官方源 (packages.termux.dev) 在国内经常连不上/极慢,
+# 连依赖都装不上。检测到官方源不可达时, 自动切换阿里云镜像 (幂等)。
+fix_mirror() {
+    local files=()
+    [ -f "$PREFIX/etc/apt/sources.list" ] && files+=("$PREFIX/etc/apt/sources.list")
+    for f in "$PREFIX"/etc/apt/sources.list.d/*.list; do
+        [ -f "$f" ] && files+=("$f")
+    done
+    [ ${#files[@]} -eq 0 ] && { warn "未找到 apt 源文件, 跳过镜像适配"; return; }
+
+    # 已用国内镜像 → 跳过
+    if grep -qE 'mirrors\.(aliyun|tuna|ustc|tencent|huaweicloud|bfsu)\.' "${files[@]}" 2>/dev/null; then
+        ok "已使用国内镜像源, 无需切换"
+        return
+    fi
+
+    # 官方源 → 测连通性
+    if grep -qE 'packages\.termux\.dev|termux\.net' "${files[@]}" 2>/dev/null; then
+        info "检测到官方源 (packages.termux.dev), 测试连通性…"
+        local code
+        code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 \
+            https://packages.termux.dev/apt/termux-main/dists/stable/Release 2>/dev/null || echo 000)
+        if [ "$code" = "200" ] || [ "$code" = "301" ]; then
+            ok "官方源可达 (HTTP $code), 保持默认"
+            return
+        fi
+        warn "官方源不可达 (HTTP $code), 切换为阿里云镜像…"
+        local f
+        for f in "${files[@]}"; do
+            if grep -qE 'packages\.termux\.dev|termux\.net' "$f"; then
+                cp "$f" "$f.bak.$(date +%s)"
+                sed -i 's#https://packages\.termux\.dev#https://mirrors.aliyun.com/termux#g; s#https://termux\.net#https://mirrors.aliyun.com/termux#g' "$f"
+                info "已切换: $f (原配置已备份)"
+            fi
+        done
+        if apt update -y >/dev/null 2>&1; then
+            ok "apt update 成功 (阿里云镜像)"
+        else
+            warn "apt update 失败, 请手动检查: pkg change-repo"
+        fi
+    else
+        warn "未识别源格式, 跳过 (如遇源问题可手动: pkg change-repo)"
+    fi
+}
+
 # ---------- 证书修复 ----------
 fix_cert() {
     if [ ! -f "$CERT_FILE" ]; then
@@ -304,6 +350,7 @@ esac
 
 info "codex-termux 安装脚本 — 仅支持 Termux aarch64"
 check_environment
+fix_mirror
 install_dependencies
 fix_cert
 install_codex

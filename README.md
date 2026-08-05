@@ -30,7 +30,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/xkxxs/codex-termux/main/inst
 | 步骤 | 说明 |
 |---|---|
 | 环境检查 | 仅支持 Termux + aarch64 |
-| 依赖安装 | `pkg install nodejs-lts patchelf`（已装则跳过） |
+| 镜像源适配 | 官方源不可达（国内常见）时自动备份并切换阿里云镜像；已用国内镜像则跳过（幂等） |
+| 依赖安装 | `pkg install nodejs-lts patchelf sudo`（已装则跳过） |
 | 证书修复 | `SSL_CERT_FILE` 写入 `~/.bashrc`（musl 二进制不认识 Android CA 路径，否则 API 请求报 `stream disconnected`） |
 | **DNS 修复** | `dns53.js` 本地 DNS 转发器 + `.bashrc` 常驻。**Android 没有 `/etc/resolv.conf`**，musl 解析器回退 `127.0.0.1:53`（无人监听）→ 每次请求卡满 5s 超时，报 `error sending request`。转发器把查询转到阿里/腾讯/电信 DNS |
 | 安装 Codex | `npm install -g @openai/codex@latest` + 手动解压 `-linux-arm64` tarball 到 vendor |
