@@ -59,48 +59,71 @@ install_dependencies() {
 }
 
 # ---------- 镜像源适配 ----------
-# 刚装的 Termux 默认官方源 (packages.termux.dev) 在国内经常连不上/极慢,
-# 连依赖都装不上。检测到官方源不可达时, 自动切换阿里云镜像 (幂等)。
+# 刚装的 Termux 默认官方源, 国内经常慢/不可达。对官方 + 国内主流镜像
+# 逐个测速 (取 2 次最快), 自动切换到最快者 (幂等)。
 fix_mirror() {
-    local files=()
-    [ -f "$PREFIX/etc/apt/sources.list" ] && files+=("$PREFIX/etc/apt/sources.list")
-    for f in "$PREFIX"/etc/apt/sources.list.d/*.list; do
-        [ -f "$f" ] && files+=("$f")
-    done
-    [ ${#files[@]} -eq 0 ] && { warn "未找到 apt 源文件, 跳过镜像适配"; return; }
+    local sources_file="$PREFIX/etc/apt/sources.list"
+    [ -f "$sources_file" ] || { warn "未找到 apt 源文件, 跳过镜像适配"; return; }
 
-    # 已用国内镜像 → 跳过
-    if grep -qE 'mirrors\.(aliyun|tuna|ustc|tencent|huaweicloud|bfsu)\.' "${files[@]}" 2>/dev/null; then
-        ok "已使用国内镜像源, 无需切换"
+    # 候选源: (显示名 URL前缀)
+    local candidates=(
+        "packages.termux.dev"
+        "mirrors.aliyun.com/termux"
+        "mirrors.tuna.tsinghua.edu.cn/termux"
+        "mirrors.ustc.edu.cn/termux"
+        "mirrors.cloud.tencent.com/termux"
+        "mirrors.huaweicloud.com/termux"
+    )
+
+    # 逐源测速 (2 次取最快, 全部失败得 99)
+    local best="" best_t=99 c t1 t2 t
+    for c in "${candidates[@]}"; do
+        t1=$(curl -s -o /dev/null -w '%{time_total}' --connect-timeout 3 --max-time 8 \
+            "https://$c/apt/termux-main/dists/stable/Release" 2>/dev/null || echo 99)
+        t2=$(curl -s -o /dev/null -w '%{time_total}' --connect-timeout 3 --max-time 8 \
+            "https://$c/apt/termux-main/dists/stable/Release" 2>/dev/null || echo 99)
+        t=$(printf '%s\n%s\n' "$t1" "$t2" | sort -n | head -1)
+        info "测速 $c: ${t}s"
+        if awk "BEGIN{exit !($t < $best_t)}"; then
+            best="$c"; best_t="$t"
+        fi
+    done
+
+    if [ -z "$best" ]; then
+        warn "全部源测速失败, 保持当前配置 (可手动: pkg change-repo)"
+        return
+    fi
+    ok "最快源: $best (${best_t}s)"
+
+    # 当前已是最快 → 不动
+    if grep -q "$best" "$sources_file" 2>/dev/null; then
+        ok "当前源已是最快, 无需切换"
         return
     fi
 
-    # 官方源 → 测连通性
-    if grep -qE 'packages\.termux\.dev|termux\.net' "${files[@]}" 2>/dev/null; then
-        info "检测到官方源 (packages.termux.dev), 测试连通性…"
-        local code
-        code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 \
-            https://packages.termux.dev/apt/termux-main/dists/stable/Release 2>/dev/null || echo 000)
-        if [ "$code" = "200" ] || [ "$code" = "301" ]; then
-            ok "官方源可达 (HTTP $code), 保持默认"
-            return
-        fi
-        warn "官方源不可达 (HTTP $code), 切换为阿里云镜像…"
-        local f
-        for f in "${files[@]}"; do
-            if grep -qE 'packages\.termux\.dev|termux\.net' "$f"; then
-                cp "$f" "$f.bak.$(date +%s)"
-                sed -i 's#https://packages\.termux\.dev#https://mirrors.aliyun.com/termux#g; s#https://termux\.net#https://mirrors.aliyun.com/termux#g' "$f"
-                info "已切换: $f (原配置已备份)"
-            fi
-        done
-        if apt update -y >/dev/null 2>&1; then
-            ok "apt update 成功 (阿里云镜像)"
-        else
-            warn "apt update 失败, 请手动检查: pkg change-repo"
-        fi
+    warn "切换源: $(grep -oE 'https://[^/]+' "$sources_file" | head -1) → $best"
+    cp "$sources_file" "$sources_file.bak.$(date +%s)"
+    {
+        echo "# The termux-main repository contains the primary packages."
+        echo "deb https://$best/apt/termux-main stable main"
+    } > "$sources_file"
+    info "已切换 (原配置已备份: sources.list.bak.*)"
+
+    if apt update -y >/dev/null 2>&1; then
+        ok "apt update 成功 ($best)"
     else
-        warn "未识别源格式, 跳过 (如遇源问题可手动: pkg change-repo)"
+        warn "apt update 失败, 请手动检查: pkg change-repo"
+    fi
+}
+
+# ---------- 全量升级 ----------
+# 换好源后把所有软件包升到最新 (幂等: 已最新则跳过)
+upgrade_packages() {
+    info "更新软件包索引并升级全部软件包…"
+    if pkg upgrade -y >/dev/null 2>&1; then
+        ok "软件包已是最新"
+    else
+        warn "pkg upgrade 未完全成功, 请稍后重试 (pkg upgrade -y)"
     fi
 }
 
@@ -351,6 +374,7 @@ esac
 info "codex-termux 安装脚本 — 仅支持 Termux aarch64"
 check_environment
 fix_mirror
+upgrade_packages
 install_dependencies
 fix_cert
 install_codex
