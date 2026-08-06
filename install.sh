@@ -178,26 +178,82 @@ fix_dns() {
     fi
 
     ok "root 可用, 使用 dns53 原生方案"
-    if [ ! -f "$dns53" ]; then
-        cat > "$dns53" << 'DNS53_EOF'
+    # 每次重跑都覆盖为最新版 (含 DNS 自动探测)
+    cat > "$dns53" << 'DNS53_EOF'
 #!/usr/bin/env node
 // dns53 — 本地 DNS 转发器 (127.0.0.1:53)
-// 背景: codex 是静态 musl 二进制, 其解析器读 /etc/resolv.conf (Android 没有),
+// 背景: musl 程序 (codex/opencode) 解析器读不到 /etc/resolv.conf (Android 没有),
 //       回退到默认 127.0.0.1:53, 而手机上没人监听该端口 → DNS 卡死 → 5s 超时。
-// 方案: 在 127.0.0.1:53 上监听 UDP, 原样转发到上游 DNS (阿里→腾讯→电信), 回传响应。
+// 方案: 在 127.0.0.1:53 上监听 UDP, 优先转发到手机当前使用的 DNS (延迟更低),
+//       再依次回退到公共 DNS (阿里→腾讯→114), 回传响应。
 // 运行: sudo node dns53.js  (53 是特权端口)
 const dgram = require('dgram');
 const fs = require('fs');
+const { execFileSync } = require('child_process');
 
-const UPSTREAMS = [
+// 公共兜底 DNS (手机 DNS 探测失败时使用)
+const PUBLIC_DNS = [
   ['223.5.5.5', 53],      // 阿里
   ['119.29.29.29', 53],   // 腾讯
-  ['218.85.152.99', 53],  // 电信(可换成本地运营商DNS)
+  ['114.114.114.114', 53],// 114
 ];
 const TIMEOUT_MS = 2000;
 // 固定路径: sudo 运行时 HOME 会变成 .suroot, 不能用 HOME 推导
 const LOG = process.env.DNS53_LOG || '/data/data/com.termux/files/home/.codex/dns53.log';
 const log = (m) => { try { fs.appendFileSync(LOG, `${new Date().toISOString()} ${m}\n`); } catch (_) {} };
+
+let UPSTREAMS = [...PUBLIC_DNS];
+
+// 探测手机当前 DNS (优先默认网络的 IPv4 地址)
+function discoverPhoneDns() {
+  const servers = [];
+  try {
+    // 老版本 Android: getprop net.*.dnsN
+    const props = execFileSync('/system/bin/getprop', [], { encoding: 'utf8', timeout: 3000 });
+    for (const line of props.split('\n')) {
+      const m = line.match(/^\[net\.\S+\.dns\d+\]:\s*\[([0-9.]+)\]/);
+      if (m) servers.push(m[1]);
+    }
+  } catch (_) {}
+  if (servers.length === 0) {
+    try {
+      // 现代 Android: dumpsys connectivity 的 DnsAddresses。
+      // 优先默认网络 (TRANSPORT_PRIMARY), 再收集所有 INTERNET+VALIDATED 网络,
+      // 避免个别机型/网络下主网络块 DnsAddresses 为空时拿不到 DNS。
+      const out = execFileSync('/system/bin/dumpsys', ['connectivity'], { encoding: 'utf8', timeout: 5000 });
+      const blocks = out.split('NetworkAgentInfo{').slice(1);
+      const scored = [];
+      for (const b of blocks) {
+        const dm = b.match(/DnsAddresses:\s*\[([^\]]*)\]/);
+        if (!dm) continue;
+        const re = /(\d{1,3}(?:\.\d{1,3}){3})/g;
+        const ips = [];
+        let hit;
+        while ((hit = re.exec(dm[1]))) ips.push(hit[1]);
+        if (!ips.length) continue;
+        const score = (b.includes('TRANSPORT_PRIMARY') ? 0 : 1) + (b.includes('INTERNET') && b.includes('VALIDATED') ? 0 : 2);
+        scored.push([score, ips]);
+      }
+      scored.sort((a, b) => a[0] - b[0]);
+      for (const [, ips] of scored) servers.push(...ips);
+    } catch (_) {}
+  }
+  return [...new Set(servers)].filter((ip) => ip !== '127.0.0.1' && ip !== '0.0.0.0');
+}
+
+// 刷新上游: 手机 DNS 在前, 公共 DNS 兜底 (每分钟一次, 网络切换后自动跟随)
+function refreshDns() {
+  const phone = discoverPhoneDns();
+  if (phone.length === 0) return;
+  const merged = [];
+  for (const ip of [...phone, ...PUBLIC_DNS.map((s) => s[0])]) {
+    if (!merged.some((s) => s[0] === ip)) merged.push([ip, 53]);
+  }
+  if (JSON.stringify(merged) !== JSON.stringify(UPSTREAMS)) {
+    UPSTREAMS = merged;
+    log(`dns servers: ${merged.map((s) => s[0]).join(', ')}`);
+  }
+}
 
 const server = dgram.createSocket('udp4');
 
@@ -228,16 +284,17 @@ server.on('message', (msg, rinfo) => {
 
 server.on('error', (e) => {
   log(`server error: ${e.message}`);
-  console.error(`dns53 server error: ${e.message}`);
+  if (process.stderr.isTTY) console.error(`dns53 server error: ${e.message}`);
 });
 server.bind(53, '127.0.0.1', () => {
+  refreshDns();
   log('dns53 listening on 127.0.0.1:53');
-  console.log('dns53 listening on 127.0.0.1:53');
+  if (process.stdout.isTTY) console.log('dns53 listening on 127.0.0.1:53');
+  setInterval(refreshDns, 60000);
 });
 DNS53_EOF
         chmod +x "$dns53"
-        info "dns53.js 已生成: $dns53"
-    fi
+        info "dns53.js 已更新: $dns53"
 
     if ! grep -q 'dns53' "$HOME_DIR/.bashrc" 2>/dev/null; then
         cat >> "$HOME_DIR/.bashrc" << 'BASHRC_EOF'

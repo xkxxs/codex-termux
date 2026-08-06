@@ -14,7 +14,7 @@
 
 > 为什么 DNS 需要特殊处理：Codex 是 musl 静态二进制，解析器读不到 Android 的
 > `/etc/resolv.conf`（该文件不存在），会回退 `127.0.0.1:53`。有 root 时由 dns53
-> 监听该端口并转发到公共 DNS；没有 root 时无法绑定特权端口 53，所以用 proot 把
+> 监听该端口，并**自动探测手机当前 DNS（运营商下发）优先转发**，公共 DNS 兜底；没有 root 时无法绑定特权端口 53，所以用 proot 把
 > `resolv.conf` 绑定到 `/etc/resolv.conf`，让 musl 直接查询公共 DNS。
 > 注意：proot 兜底依赖网络允许普通 App 直连公网 DNS 53 端口，个别网络/运营商
 > 会拦截，此时仍需 root 方案。
@@ -52,7 +52,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/xkxxs/codex-termux/main/inst
 | 全量升级 | 换好源后 `pkg upgrade -y` 把所有软件包升到最新 |
 | 依赖安装 | `pkg install nodejs-lts patchelf sudo/proot`：有 root 装 sudo，无 root 自动装 proot（已装则跳过） |
 | 证书修复 | `SSL_CERT_FILE` 写入 `~/.bashrc`（musl 二进制不认识 Android CA 路径，否则 API 请求报 `stream disconnected`） |
-| **DNS 修复** | 有 root：`dns53.js` 本地 DNS 转发器 + `.bashrc` 常驻；无 root：proot 绑定 `resolv.conf` 兜底。**Android 没有 `/etc/resolv.conf`**，musl 解析器回退 `127.0.0.1:53`（无人监听）→ 每次请求卡满 5s 超时，报 `error sending request`。转发器把查询转到阿里/腾讯/电信 DNS |
+| **DNS 修复** | 有 root：`dns53.js` 本地 DNS 转发器 + `.bashrc` 常驻（**自动优先手机当前 DNS**）；无 root：proot 绑定 `resolv.conf` 兜底。**Android 没有 `/etc/resolv.conf`**，musl 解析器回退 `127.0.0.1:53`（无人监听）→ 每次请求卡满 5s 超时，报 `error sending request`。转发器把查询转到阿里/腾讯/电信 DNS |
 | 安装 Codex | `npm install -g @openai/codex@latest` + 手动解压 `-linux-arm64` tarball 到 vendor |
 | 生成 wrapper | `~/.local/bin/codex`：固定 `version.json` 防假升级循环、注入证书、自动拉起 dns53、`codex update` 完整升级流程 |
 | 验证 | `codex --version` |
@@ -75,7 +75,7 @@ bash <(curl -fsSL …/install.sh) --uninstall  # 卸载
 | DNS 卡死 | 每次请求**恰好卡 5 秒**后失败（重试 5 次共 ~36s） | 本脚本已装 dns53 转发器并写入 `.bashrc` 常驻。**打开新终端即生效** |
 | 证书缺失 | curl 正常但 codex 失败 | 本脚本已设置 `SSL_CERT_FILE` |
 
-有 root 时走 dns53 原生方案（需要手机已 root/Magisk 且 Termux 的 `sudo` 可用，脚本自动 `pkg install sudo`）；没有 root 时脚本自动改用 proot 兜底（自动 `pkg install proot`），无需 root 也能正常解析。proot 兜底性能略降，且要求网络允许普通 App 直连公网 DNS 53 端口。
+有 root 时走 dns53 原生方案（需要手机已 root/Magisk 且 Termux 的 `sudo` 可用，脚本自动 `pkg install sudo`）；没有 root 时脚本自动改用 proot 兜底（自动 `pkg install proot`），无需 root 也能正常解析。dns53 会自动探测并优先使用手机当前下发的 DNS（运营商 DNS），公共 DNS 兜底。proot 兜底性能略降，且要求网络允许普通 App 直连公网 DNS 53 端口。
 
 ## 配置模型（DeepSeek 等）
 
