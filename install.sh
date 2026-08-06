@@ -1,7 +1,7 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # ============================================================
 # codex-termux — 在 Termux (Android aarch64) 上一键安装官方 Codex CLI
-# 前置要求: 手机已 root (Magisk) 并授权 Termux, 需要 sudo 绑定特权端口 53
+# 前置要求: 有 root → dns53 原生方案; 无 root → proot 兜底 (无需 root, 自动检测)
 #
 # 用法:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/<USER>/codex-termux/main/install.sh)
@@ -50,12 +50,24 @@ install_dependencies() {
     command -v node >/dev/null || need+=(nodejs-lts)
     command -v npm >/dev/null || need+=(nodejs-lts)
     command -v patchelf >/dev/null || need+=(patchelf)
-    command -v sudo >/dev/null || need+=(sudo)  # dns53 绑定特权端口 53 需要 root
+    # 有 root → dns53 原生方案; 无 root → proot 兜底 (wrapper 运行时自动选择)
+    if command -v sudo >/dev/null 2>&1; then
+        if ! sudo -n true 2>/dev/null; then
+            need+=(proot)
+        fi
+    else
+        need+=(sudo)
+    fi
     if [ ${#need[@]} -gt 0 ]; then
         info "安装依赖: ${need[*]}"
         pkg install -y "${need[@]}" || fail "依赖安装失败, 请先手动执行 pkg update && pkg upgrade"
     else
         ok "依赖已就绪 (node $(node --version), patchelf)"
+    fi
+    # sudo 刚装完再验证一次; 仍无 root 则补 proot
+    if ! sudo -n true 2>/dev/null; then
+        command -v proot >/dev/null 2>&1 || { info "未检测到 root, 安装 proot 兜底…"; pkg install -y proot; }
+        warn "未检测到 root: 将使用 proot 兜底方案 (性能略降)"
     fi
 }
 
@@ -146,18 +158,34 @@ fix_cert() {
 # ---------- DNS 修复 ----------
 # musl 解析器读不到 /etc/resolv.conf (Android 没有), 回退 127.0.0.1:53
 # 而手机无人监听该端口 → 每次 API 请求卡满 5s 超时 (报错与 SSL 证书问题
-# 几乎相同: "error sending request for url")。方案: 本地转发器 + .bashrc 常驻。
+# 几乎相同: "error sending request for url")。方案:
+#   有 root → dns53 本地转发器 + .bashrc 常驻
+#   无 root → proot 绑定 resolv.conf 兜底 (wrapper 运行时自动选择)
 fix_dns() {
     local dns53="$HOME_DIR/.local/bin/dns53.js"
     mkdir -p "$HOME_DIR/.local/bin"
 
+    # 无 root 兜底需要这份文件 (proot 绑定给 musl 读取)
+    if [ ! -s "$PREFIX/etc/resolv.conf" ]; then
+        printf 'nameserver 223.5.5.5\nnameserver 119.29.29.29\n' > "$PREFIX/etc/resolv.conf"
+        info "已生成 $PREFIX/etc/resolv.conf (proot 兜底用)"
+    fi
+
+    if ! command -v sudo >/dev/null 2>&1 || ! sudo -n true 2>/dev/null; then
+        info "未检测到 root, 使用 proot 兜底 (wrapper 会自动绑定 resolv.conf)"
+        info "如需原生直跑方案, 请在 Magisk 中授权 Termux 后重跑本脚本"
+        return
+    fi
+
+    ok "root 可用, 使用 dns53 原生方案"
     if [ ! -f "$dns53" ]; then
         cat > "$dns53" << 'DNS53_EOF'
 #!/usr/bin/env node
 // dns53 — 本地 DNS 转发器 (127.0.0.1:53)
-// 背景: musl 程序 (codex/opencode) 解析器读不到 /etc/resolv.conf (Android 没有),
-//       回退到默认 127.0.0.1:53, 而手机无人监听 → DNS 卡死 5s 超时。
-// 方案: 在 127.0.0.1:53 监听 UDP, 原样转发到上游 DNS (阿里→腾讯→电信), 回传响应。
+// 背景: codex 是静态 musl 二进制, 其解析器读 /etc/resolv.conf (Android 没有),
+//       回退到默认 127.0.0.1:53, 而手机上没人监听该端口 → DNS 卡死 → 5s 超时。
+// 方案: 在 127.0.0.1:53 上监听 UDP, 原样转发到上游 DNS (阿里→腾讯→电信), 回传响应。
+// 运行: sudo node dns53.js  (53 是特权端口)
 const dgram = require('dgram');
 const fs = require('fs');
 
@@ -211,7 +239,6 @@ DNS53_EOF
         info "dns53.js 已生成: $dns53"
     fi
 
-    # 写入 .bashrc 常驻 (幂等)
     if ! grep -q 'dns53' "$HOME_DIR/.bashrc" 2>/dev/null; then
         cat >> "$HOME_DIR/.bashrc" << 'BASHRC_EOF'
 
@@ -228,13 +255,7 @@ BASHRC_EOF
         info "dns53 常驻逻辑已写入 ~/.bashrc"
     fi
 
-    # 立即启动 (需要 root 绑定特权端口 53)
-    if ! command -v sudo >/dev/null 2>&1 || ! sudo -n true 2>/dev/null; then
-        warn "未检测到可用 root (sudo -n true 失败)。dns53 需要 root 才能绑定 53 端口,"
-        warn "没有 root 时 Codex 的 DNS 会超时。请先在 Magisk 中允许 Termux root,"
-        warn "再重跑本脚本或手动启动: sudo node ~/.local/bin/dns53.js"
-        return
-    fi
+    # 立即启动
     if ! sudo -n pgrep -f "dns5[3].js" > /dev/null 2>&1; then
         sudo -n nohup node "$dns53" > "$HOME_DIR/.codex/dns53.log" 2>&1 &
         sleep 1
@@ -306,13 +327,22 @@ case "${1:-}" in
         ;;
     *)
         pin_version
-        # musl 解析器读不到 /etc/resolv.conf, 回退 127.0.0.1:53 无人监听
-        # → DNS 卡死 5s 超时。确保本地 DNS 转发器在跑 (见 README "DNS 修复")。
-        if ! sudo -n pgrep -f "dns5[3].js" > /dev/null 2>&1; then
-            sudo -n nohup node "$HOME/.local/bin/dns53.js" > "$HOME/.codex/dns53.log" 2>&1 &
-            sleep 1
+        RESOLV_CONF="${PREFIX:-/data/data/com.termux/files/usr}/etc/resolv.conf"
+        # 有 root: 确保本地 DNS 转发器在跑 (见 README "DNS 修复")
+        # 无 root: proot 绑定 resolv.conf, 让 musl 直接读公共 DNS
+        if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+            if ! sudo -n pgrep -f "dns5[3].js" > /dev/null 2>&1; then
+                sudo -n nohup node "$HOME/.local/bin/dns53.js" > "$HOME/.codex/dns53.log" 2>&1 &
+                sleep 1
+            fi
+            exec node "$REAL_JS" "$@"
+        elif command -v proot >/dev/null 2>&1; then
+            [ -f "$RESOLV_CONF" ] || { echo "缺少 $RESOLV_CONF, 请重跑安装脚本" >&2; exit 1; }
+            exec proot -b "$RESOLV_CONF:/etc/resolv.conf" node "$REAL_JS" "$@"
+        else
+            echo "未检测到 root 且缺少 proot, 请先安装: pkg install proot" >&2
+            exit 1
         fi
-        exec node "$REAL_JS" "$@"
         ;;
 esac
 WRAPPER_EOF
