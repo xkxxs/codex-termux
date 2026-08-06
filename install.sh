@@ -1,6 +1,7 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # ============================================================
 # codex-termux — 在 Termux (Android aarch64) 上一键安装官方 Codex CLI
+# 前置要求: 手机已 root (Magisk) 并授权 Termux, 需要 sudo 绑定特权端口 53
 #
 # 用法:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/<USER>/codex-termux/main/install.sh)
@@ -166,7 +167,8 @@ const UPSTREAMS = [
   ['218.85.152.99', 53],  // 电信(可换成本地运营商DNS)
 ];
 const TIMEOUT_MS = 2000;
-const LOG = process.env.DNS53_LOG || process.env.HOME + '/.codex/dns53.log';
+// 固定路径: sudo 运行时 HOME 会变成 .suroot, 不能用 HOME 推导
+const LOG = process.env.DNS53_LOG || '/data/data/com.termux/files/home/.codex/dns53.log';
 const log = (m) => { try { fs.appendFileSync(LOG, `${new Date().toISOString()} ${m}\n`); } catch (_) {} };
 
 const server = dgram.createSocket('udp4');
@@ -196,7 +198,10 @@ server.on('message', (msg, rinfo) => {
   tryNext();
 });
 
-server.on('error', (e) => log(`server error: ${e.message}`));
+server.on('error', (e) => {
+  log(`server error: ${e.message}`);
+  console.error(`dns53 server error: ${e.message}`);
+});
 server.bind(53, '127.0.0.1', () => {
   log('dns53 listening on 127.0.0.1:53');
   console.log('dns53 listening on 127.0.0.1:53');
@@ -215,25 +220,27 @@ DNS53_EOF
 #       回退到 127.0.0.1:53, 而手机无人监听 → DNS 卡死 5s 超时。
 # dns53.js 在本机 53 端口监听, 转发到阿里/腾讯/电信 DNS, 是这些程序的唯一出路。
 # 每次打开 Termux 终端检查一次, 没在跑就拉起 (root 绑定特权端口)。
-if ! pgrep -f "dns5[3].js" > /dev/null 2>&1; then
-    sudo nohup node "$HOME/.local/bin/dns53.js" > "$HOME/.codex/dns53.log" 2>&1 &
+if ! sudo -n pgrep -f "dns5[3].js" > /dev/null 2>&1; then
+    sudo -n nohup node "$HOME/.local/bin/dns53.js" > "$HOME/.codex/dns53.log" 2>&1 &
     sleep 1
 fi
 BASHRC_EOF
         info "dns53 常驻逻辑已写入 ~/.bashrc"
     fi
 
-    # 立即启动
-    if command -v sudo >/dev/null 2>&1; then
-        if ! pgrep -f "dns5[3].js" > /dev/null 2>&1; then
-            sudo nohup node "$dns53" > "$HOME_DIR/.codex/dns53.log" 2>&1 &
-            sleep 1
-            ok "DNS 转发器已启动 (127.0.0.1:53)"
-        else
-            ok "DNS 转发器已在运行"
-        fi
+    # 立即启动 (需要 root 绑定特权端口 53)
+    if ! command -v sudo >/dev/null 2>&1 || ! sudo -n true 2>/dev/null; then
+        warn "未检测到可用 root (sudo -n true 失败)。dns53 需要 root 才能绑定 53 端口,"
+        warn "没有 root 时 Codex 的 DNS 会超时。请先在 Magisk 中允许 Termux root,"
+        warn "再重跑本脚本或手动启动: sudo node ~/.local/bin/dns53.js"
+        return
+    fi
+    if ! sudo -n pgrep -f "dns5[3].js" > /dev/null 2>&1; then
+        sudo -n nohup node "$dns53" > "$HOME_DIR/.codex/dns53.log" 2>&1 &
+        sleep 1
+        ok "DNS 转发器已启动 (127.0.0.1:53)"
     else
-        warn "未检测到 sudo, 请手动启动: sudo node ~/.local/bin/dns53.js"
+        ok "DNS 转发器已在运行"
     fi
 }
 
@@ -301,8 +308,8 @@ case "${1:-}" in
         pin_version
         # musl 解析器读不到 /etc/resolv.conf, 回退 127.0.0.1:53 无人监听
         # → DNS 卡死 5s 超时。确保本地 DNS 转发器在跑 (见 README "DNS 修复")。
-        if ! pgrep -f "dns5[3].js" > /dev/null; then
-            sudo nohup node "$HOME/.local/bin/dns53.js" > "$HOME/.codex/dns53.log" 2>&1 &
+        if ! sudo -n pgrep -f "dns5[3].js" > /dev/null 2>&1; then
+            sudo -n nohup node "$HOME/.local/bin/dns53.js" > "$HOME/.codex/dns53.log" 2>&1 &
             sleep 1
         fi
         exec node "$REAL_JS" "$@"
