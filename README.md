@@ -54,17 +54,24 @@ bash <(curl -fsSL https://raw.githubusercontent.com/xkxxs/codex-termux/main/inst
 | 证书修复 | `SSL_CERT_FILE` 写入 `~/.bashrc`（musl 二进制不认识 Android CA 路径，否则 API 请求报 `stream disconnected`） |
 | **DNS 修复** | 有 root：`dns53.js` 本地 DNS 转发器 + `.bashrc` 常驻（**自动优先手机当前 DNS**）；无 root：proot 绑定 `resolv.conf` 兜底。**Android 没有 `/etc/resolv.conf`**，musl 解析器回退 `127.0.0.1:53`（无人监听）→ 每次请求卡满 5s 超时，报 `error sending request`。转发器把查询转到阿里/腾讯/电信 DNS |
 | 安装 Codex | `npm install -g @openai/codex@latest` + 手动解压 `-linux-arm64` tarball 到 vendor |
-| 生成 wrapper | `~/.local/bin/codex`：固定 `version.json` 防假升级循环、注入证书、自动拉起 dns53、`codex update` 完整升级流程 |
+| 生成 wrapper | `~/.local/bin/codex`：**启动前自动检查最新版，非最新自动更新再启动**（可 `CODEX_NO_AUTO_UPDATE=1` 跳过）、固定 `version.json` 防假升级循环、注入证书、自动拉起 dns53、`codex update` 手动强制升级流程 |
 | 验证 | `codex --version` |
 
 ## 使用
 
 ```bash
-codex                     # 启动
-codex update              # 更新到最新版
+codex                     # 启动：先检查最新版，非最新自动更新再启动（已最新直接启动）
+codex update              # 手动强制更新到最新版
 bash <(curl -fsSL …/install.sh)              # 重跑即更新（幂等）
 bash <(curl -fsSL …/install.sh) --uninstall  # 卸载
 ```
+
+> **自动更新说明**：每次执行 `codex` 时，wrapper 会先查一次 npm 上的最新版
+> （10 秒内快速失败，网络差时静默跳过），与本地版本比较（`sort -V`）：
+> - 有新版 → 自动执行完整更新（npm 主包 → 重新解压 linux-arm64 二进制到 vendor → 固定 version.json），完成后继续启动
+> - 更新失败（如网络中断）→ 不阻塞，直接用现有版本启动
+> - 已是最新 → 直接启动，零额外等待
+> - 临时跳过检查：`CODEX_NO_AUTO_UPDATE=1 codex ...`
 
 ## 常见问题
 
@@ -117,7 +124,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/xkxxs/codex-termux/main/inst
 |---|---|---|
 | `stream disconnected before completion: error sending request` | musl 二进制找不到 CA 证书 | 脚本已自动处理；手动: `export SSL_CERT_FILE=/data/data/com.termux/files/usr/etc/tls/cert.pem` |
 | `unknown variant 'max'` | models.json 用了新版档位，Codex ≤0.121 | 把 `max` 改成 `xhigh`，或升级 Codex |
-| 启动提示升级且无限循环 | `version.json` 的版本号与本地二进制不一致 | wrapper 已自动固定；不要用社区适配包 |
+| 启动提示升级且无限循环 | `version.json` 的版本号与本地二进制不一致 | wrapper 已自动固定且**启动前自动更新**，不会出现假升级；不要用社区适配包 |
 | 没有 root | 无法绑定 53 端口，dns53 方案不可用 | 脚本自动改用 proot 兜底（自动 `pkg install proot`），无需 root |
 
 ## 许可证
