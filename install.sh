@@ -348,41 +348,89 @@ write_wrapper() {
     mkdir -p "$HOME_DIR/.local/bin"
     cat > "$WRAPPER_PATH" << 'WRAPPER_EOF'
 #!/data/data/com.termux/files/usr/bin/bash
+# ============================================================
+# codex wrapper for Termux (由 codex-termux/install.sh 生成)
+# - 启动前自动检查最新版本, 非最新则自动更新再启动
+#   (可用 CODEX_NO_AUTO_UPDATE=1 跳过检查)
+# - 固定 ~/.codex/version.json, 避免上游版本号与本地二进制
+#   不一致导致的假升级循环
+# - 注入 SSL_CERT_FILE (musl 二进制不认 Android 的 CA 路径)
+# - DNS: 有 root → dns53 转发器; 无 root → proot 绑 resolv.conf
+# ============================================================
 set -euo pipefail
 
 # musl 二进制不认识 Android 的 CA 路径, 必须指定
 export SSL_CERT_FILE="${SSL_CERT_FILE:-/data/data/com.termux/files/usr/etc/tls/cert.pem}"
 
 REAL_JS="/data/data/com.termux/files/usr/lib/node_modules/@openai/codex/bin/codex.js"
+PKG_DIR="/data/data/com.termux/files/usr/lib/node_modules/@openai/codex"
+VENDOR_BIN="$PKG_DIR/vendor/aarch64-unknown-linux-musl/bin/codex"
 VERSION_FILE="$HOME/.codex/version.json"
 
-detect_version() {
+# 本地实际版本 (如 0.147.0); 失败时为空
+current_version() {
     node "$REAL_JS" --version 2>/dev/null | sed 's/.*cli //'
 }
 
-INSTALLED_VERSION="$(detect_version)"
+# npm 源上的最新版本; 失败时为空 (快速失败, 不拖慢启动)
+latest_version() {
+    npm view @openai/codex version --fetch-timeout=10000 --fetch-retries=0 2>/dev/null || true
+}
 
-# 固定 version.json, 避免上游版本号与本地二进制不一致导致假升级循环
+# 版本比较: $1 >= $2 返回 0 (sort -V 语义)
+version_ge() {
+    [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" = "$1" ]
+}
+
+# 固定 version.json 为当前实际版本, 避免假升级循环
 pin_version() {
+    local v
+    v="$(current_version)"
     cat > "$VERSION_FILE" <<EOF
-{"latest_version":"$INSTALLED_VERSION","last_checked_at":"$(date -u +%Y-%m-%dT%H:%M:%S.000000000Z)","dismissed_version":"$INSTALLED_VERSION"}
+{"latest_version":"$v","last_checked_at":"$(date -u +%Y-%m-%dT%H:%M:%S.000000000Z)","dismissed_version":"$v"}
 EOF
+}
+
+# 完整更新: npm 主包 → 下载对应 linux-arm64 平台二进制 → 解压 vendor。
+# 失败返回 1, 不影响旧二进制继续使用。
+do_update() {
+    echo "→ 更新 @openai/codex (npm 主包)…"
+    npm install -g @openai/codex@latest >/dev/null 2>&1 || return 1
+    local ver
+    ver="$(npm view @openai/codex version --fetch-timeout=10000 --fetch-retries=0 2>/dev/null)" || return 1
+    echo "→ 下载 linux-arm64 平台二进制 v${ver} (绕过 npm os 限制)…"
+    local tarball
+    tarball="$(npm pack "@openai/codex@${ver}-linux-arm64" --silent)" || return 1
+    rm -rf "$PKG_DIR/vendor"
+    tar xzf "$tarball" -C "$PKG_DIR" --strip-components=1 package/vendor
+    rm -f "$tarball"
+    [ -x "$VENDOR_BIN" ] || return 1
+    chmod +x "$VENDOR_BIN"
+    pin_version
+    echo "✓ 已更新: $(current_version)"
 }
 
 case "${1:-}" in
     --update|-u|update|upgrade)
-        echo "→ Updating @openai/codex …"
-        npm install -g @openai/codex@latest
-        NEWVER=$(npm view @openai/codex version)
-        echo "→ Downloading platform binary v${NEWVER} …"
-        TARBALL=$(npm pack "@openai/codex@${NEWVER}-linux-arm64" --silent)
-        tar xzf "$TARBALL" -C /data/data/com.termux/files/usr/lib/node_modules/@openai/codex/ --strip-components=1 package/vendor
-        rm -f "$TARBALL"
-        INSTALLED_VERSION="$(detect_version)"
-        pin_version
-        echo "✓ Updated to $INSTALLED_VERSION"
+        do_update || { echo "!! 更新失败" >&2; exit 1; }
         ;;
     *)
+        # 自动更新: 启动前查一次最新版 (失败静默跳过),
+        # 非最新则自动更新; 更新失败不阻塞, 用现有版本启动
+        if [ "${CODEX_NO_AUTO_UPDATE:-0}" != "1" ] && command -v npm >/dev/null 2>&1; then
+            LATEST="$(latest_version)"
+            if [ -n "$LATEST" ]; then
+                CURRENT="$(current_version)"
+                if [ -z "$CURRENT" ] || ! version_ge "$CURRENT" "$LATEST"; then
+                    echo "→ 检测到新版本 v${LATEST} (当前 ${CURRENT:-未知}), 自动更新…"
+                    if do_update; then
+                        echo "→ 更新完毕, 继续启动 codex…"
+                    else
+                        echo "!! 自动更新失败, 继续使用现有版本启动" >&2
+                    fi
+                fi
+            fi
+        fi
         pin_version
         RESOLV_CONF="${PREFIX:-/data/data/com.termux/files/usr}/etc/resolv.conf"
         # 有 root: 确保本地 DNS 转发器在跑 (见 README "DNS 修复")
