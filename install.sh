@@ -160,19 +160,209 @@ fix_cert() {
 # 而手机无人监听该端口 → 每次 API 请求卡满 5s 超时 (报错与 SSL 证书问题
 # 几乎相同: "error sending request for url")。方案:
 #   有 root → dns53 本地转发器 + .bashrc 常驻
-#   无 root → proot 绑定 resolv.conf 兜底 (wrapper 运行时自动选择)
+#   无 root → dns-bootstrap 实测校验 + proot 绑定 resolv.conf (wrapper 运行时自动选择)
 fix_dns() {
     local dns53="$HOME_DIR/.local/bin/dns53.js"
+    local dnsboot="$HOME_DIR/.local/bin/dns-bootstrap.js"
     mkdir -p "$HOME_DIR/.local/bin"
 
-    # 无 root 兜底需要这份文件 (proot 绑定给 musl 读取)
-    if [ ! -s "$PREFIX/etc/resolv.conf" ]; then
-        printf 'nameserver 223.5.5.5\nnameserver 119.29.29.29\n' > "$PREFIX/etc/resolv.conf"
-        info "已生成 $PREFIX/etc/resolv.conf (proot 兜底用)"
-    fi
-
     if ! command -v sudo >/dev/null 2>&1 || ! sudo -n true 2>/dev/null; then
-        info "未检测到 root, 使用 proot 兜底 (wrapper 会自动绑定 resolv.conf)"
+        info "未检测到 root, 使用 dns-bootstrap + proot 兜底"
+        info "dns-bootstrap 会自动实测候选 DNS 应答质量 (SERVFAIL/空/被过滤全判废), 只写入真实可用的 resolv.conf"
+        cat > "$dnsboot" << 'DNSBOOT_EOF'
+#!/usr/bin/env node
+// dns-bootstrap — 无 root 环境下的 DNS 自动校验器
+// 背景: musl 程序 (codex/opencode) 解析器读不到 /etc/resolv.conf (Android 没有)。
+//       有 root 时 dns53.js 监听 127.0.0.1:53 转发解析; 无 root 绑不了特权端口,
+//       只能让 musl 直接查 resolv.conf 里的公网 DNS。
+//       本脚本解决后者: 实际探测当前网络 → 逐个实测公网 DNS 应答质量
+//       (SERVFAIL/空应答/CNAME-only 全判废) → 只把"实测通过"的写进 resolv.conf,
+//       再交给 proot 绑定。网络被拦截时给出明确报错, 不再静默卡 5 秒。
+// 用法:
+//   node dns-bootstrap.js            # 单次校验并重写 resolv.conf (wrapper 启动前用)
+//   node dns-bootstrap.js --daemon   # 常驻: 每 60s 重测重写 (开机/打开终端时拉起)
+const dgram = require('dgram');
+const fs = require('fs');
+const path = require('path');
+const { execFileSync } = require('child_process');
+
+const PUBLIC_DNS = ['223.5.5.5', '119.29.29.29', '114.114.114.114'];
+// 测速用域名: 主测 API 域名; 若主域名本身被网络过滤, 回退测国内域名判断网络是否可用
+const PROBE_DOMAINS = ['api.deepseek.com', 'www.baidu.com'];
+const TIMEOUT_MS = 2500;
+const RESOLV = process.env.DNS_RESOLV_CONF ||
+  `${process.env.PREFIX || '/data/data/com.termux/files/usr'}/etc/resolv.conf`;
+const LOG = process.env.DNS_BOOTSTRAP_LOG ||
+  `${process.env.HOME || '/data/data/com.termux/files/home'}/.codex/dns-bootstrap.log`;
+const log = (m) => { try { fs.appendFileSync(LOG, `${new Date().toISOString()} ${m}\n`); } catch (_) {} };
+
+// 探测手机当前网络 DNS (与 dns53 同一套逻辑, 无 root 也能跑 dumpsys)
+function discoverPhoneDns() {
+  const servers = [];
+  try {
+    const props = execFileSync('/system/bin/getprop', [], { encoding: 'utf8', timeout: 3000 });
+    for (const line of props.split('\n')) {
+      const m = line.match(/^\[net\.\S+\.dns\d+\]:\s*\[([0-9.]+)\]/);
+      if (m) servers.push(m[1]);
+    }
+  } catch (_) {}
+  if (servers.length === 0) {
+    try {
+      const out = execFileSync('/system/bin/dumpsys', ['connectivity'], { encoding: 'utf8', timeout: 5000 });
+      const blocks = out.split('NetworkAgentInfo{').slice(1);
+      const scored = [];
+      for (const b of blocks) {
+        const dm = b.match(/DnsAddresses:\s*\[([^\]]*)\]/);
+        if (!dm) continue;
+        const ips = [];
+        let hit;
+        const re = /(\d{1,3}(?:\.\d{1,3}){3})/g;
+        while ((hit = re.exec(dm[1]))) ips.push(hit[1]);
+        if (!ips.length) continue;
+        const score = (b.includes('TRANSPORT_PRIMARY') ? 0 : 1) + (b.includes('INTERNET') && b.includes('VALIDATED') ? 0 : 2);
+        scored.push([score, ips]);
+      }
+      scored.sort((a, b) => a[0] - b[0]);
+      for (const [, ips] of scored) servers.push(...ips);
+    } catch (_) {}
+  }
+  return [...new Set(servers)].filter((ip) => ip !== '127.0.0.1' && ip !== '0.0.0.0');
+}
+
+// DNS 查询 (UDP 53, 非特权端口即可发起)
+function queryDNS(server, host, timeout = TIMEOUT_MS) {
+  return new Promise((resolve) => {
+    const sock = dgram.createSocket('udp4');
+    const id = Buffer.from([Math.floor(Math.random() * 256), Math.floor(Math.random() * 256)]);
+    const q = Buffer.alloc(12 + 2 + host.length + 4);
+    id.copy(q, 0);
+    q[5] = 1; // RD
+    let off = 12;
+    for (const part of host.split('.')) { q[off++] = part.length; q.write(part, off); off += part.length; }
+    q[off++] = 0; q[off++] = 0; q[off++] = 1; q[off++] = 0; q[off++] = 1; // A IN
+    const t0 = Date.now();
+    const timer = setTimeout(() => { try { sock.close(); } catch (_) {} resolve({ ok: false, reason: 'timeout', ms: Date.now() - t0 }); }, timeout);
+    sock.on('message', (resp) => {
+      clearTimeout(timer);
+      resolve({ ok: !badAnswer(resp), ms: Date.now() - t0, raw: resp });
+      try { sock.close(); } catch (_) {}
+    });
+    sock.on('error', () => { clearTimeout(timer); try { sock.close(); } catch (_) {} resolve({ ok: false, reason: 'error', ms: Date.now() - t0 }); });
+    sock.send(q, 53, server);
+  });
+}
+
+// 应答校验: 返回 true = 应答有问题 (与 dns53 的 isBadResponse 同套标准)
+// 坏应答: 报文过短 / SERVFAIL / rcode=0 无答案 / 查 A 却只回 CNAME 不附地址 (ISP 过滤)
+function badAnswer(resp) {
+  if (resp.length < 12) return true;
+  const rcode = resp.readUInt16BE(2) & 0x0f;
+  if (rcode === 2) return true;
+  if (rcode !== 0 && rcode !== 3) return true; // 只放行 NOERROR / NXDOMAIN
+  const qd = resp.readUInt16BE(4);
+  const an = resp.readUInt16BE(6);
+  if (an === 0) return rcode === 0; // NOERROR 无答案 = 被过滤; NXDOMAIN 合法
+  let off = 12;
+  const skipName = (p) => {
+    let hops = 0;
+    while (off < p.length && p[off] !== 0) {
+      if ((p[off] & 0xc0) === 0xc0) { off += 2; return; }
+      off += p[off] + 1;
+      if (++hops > 32) break;
+    }
+    off++;
+  };
+  for (let i = 0; i < qd && off < resp.length; i++) { skipName(resp); off += 4; }
+  for (let i = 0; i < an && off + 10 <= resp.length; i++) {
+    skipName(resp);
+    const type = resp.readUInt16BE(off);
+    const len = resp.readUInt16BE(off + 8);
+    off += 10 + len;
+    if (type === 1 || type === 28) return false; // 有 A/AAAA 记录
+  }
+  return true; // 只有 CNAME/NS 等 → 过滤特征
+}
+
+// 对单个服务器实测: 主域名失败再试备域名, 任一通过即为可用
+async function probe(server) {
+  for (const host of PROBE_DOMAINS) {
+    const r = await queryDNS(server, host);
+    if (r.ok) return { ip: server, ms: r.ms, host, ok: true };
+  }
+  return { ip: server, ms: Infinity, ok: false };
+}
+
+async function runOnce() {
+  const phone = discoverPhoneDns();
+  const candidates = [...phone, ...PUBLIC_DNS];
+  const uniq = [];
+  for (const ip of candidates) if (!uniq.includes(ip)) uniq.push(ip);
+  if (uniq.length === 0) uniq.push(...PUBLIC_DNS);
+
+  const results = await Promise.all(uniq.map((ip) => probe(ip)));
+  const good = results.filter((r) => r.ok).sort((a, b) => a.ms - b.ms);
+
+  for (const r of results) {
+    log(`probe ${r.ip}: ${r.ok ? `OK ${r.ms}ms via ${r.host}` : 'FAILED'}`);
+  }
+
+  const comment = [];
+  if (phone.length) comment.push(`# phone dns: ${phone.join(', ')}`);
+  const top = good.slice(0, 3);
+  const body = top.length
+    ? top.map((r) => `nameserver ${r.ip}`).join('\n') + '\n'
+    : 'nameserver 223.5.5.5\nnameserver 119.29.29.29\n';
+
+  fs.mkdirSync(path.dirname(RESOLV), { recursive: true });
+  fs.writeFileSync(RESOLV, `${comment.join('\n')}\n# auto-written by dns-bootstrap.js @ ${new Date().toISOString()}\n${body}`);
+  log(`resolv.conf updated: ${top.map((r) => r.ip).join(', ') || 'NONE (fallback public)'}`);
+
+  return good.length;
+}
+
+async function main() {
+  const daemon = process.argv.includes('--daemon');
+  const doOnce = async () => {
+    try {
+      const n = await runOnce();
+      if (n === 0) log('ALL upstreams failed — network DNS likely blocked');
+    } catch (e) {
+      log(`error: ${e.message}`);
+      process.exitCode = 1;
+    }
+  };
+  if (daemon) {
+    await doOnce();
+    log('daemon started (poll every 60s)');
+    setInterval(() => { doOnce(); }, 60000);
+  } else {
+    await doOnce();
+  }
+}
+
+main();
+DNSBOOT_EOF
+
+        chmod +x "$dnsboot"
+        info "dns-bootstrap.js 已写入: $dnsboot"
+
+        # 无 root 常驻: 每 60s 重测重写 resolv.conf, 网络切换自动跟随
+        if ! grep -q 'dns-bootstrap' "$HOME_DIR/.bashrc" 2>/dev/null; then
+            cat >> "$HOME_DIR/.bashrc" << 'DNSBOOT_RC_EOF'
+
+# ===== DNS 自动校验常驻 (dns-bootstrap, 无 root 方案) =====
+# 无 root 时由它实测候选公网 DNS 应答质量, 只把真实可用的写进 resolv.conf,
+# 交给 proot 绑定给 musl 读取。每 60s 重测, 切 WiFi/基站自动跟随。
+if ! pgrep -f "dns-bootstrap[.]js.*daemon" > /dev/null 2>&1; then
+    nohup node "$HOME/.local/bin/dns-bootstrap.js" --daemon >> "$HOME/.codex/dns-bootstrap.log" 2>&1 &
+    sleep 1
+fi
+DNSBOOT_RC_EOF
+            info "dns-bootstrap 常驻逻辑已写入 ~/.bashrc"
+        fi
+
+        # 立即实测一次并生成 resolv.conf (proot 绑定用)
+        node "$dnsboot" || warn "当前网络 DNS 全部不可用 (53 被拦截?), 已回退公共 DNS 写入 resolv.conf"
         info "如需原生直跑方案, 请在 Magisk 中授权 Termux 后重跑本脚本"
         return
     fi
@@ -494,7 +684,7 @@ case "${1:-}" in
         pin_version
         RESOLV_CONF="${PREFIX:-/data/data/com.termux/files/usr}/etc/resolv.conf"
         # 有 root: 确保本地 DNS 转发器在跑 (见 README "DNS 修复")
-        # 无 root: proot 绑定 resolv.conf, 让 musl 直接读公共 DNS
+        # 无 root: dns-bootstrap 实测校验后 proot 绑定 resolv.conf
         if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
             if ! sudo -n pgrep -f "dns5[3].js" > /dev/null 2>&1; then
                 sudo -n nohup node "$HOME/.local/bin/dns53.js" > "$HOME/.codex/dns53.log" 2>&1 &
@@ -503,6 +693,11 @@ case "${1:-}" in
             exec node "$REAL_JS" "$@"
         elif command -v proot >/dev/null 2>&1; then
             [ -f "$RESOLV_CONF" ] || { echo "缺少 $RESOLV_CONF, 请重跑安装脚本" >&2; exit 1; }
+            # 常驻校验器没在跑 → 单次实测重写 resolv.conf
+            if ! pgrep -f "dns-bootstrap[.]js.*daemon" > /dev/null 2>&1; then
+                node "$HOME/.local/bin/dns-bootstrap.js" \
+                    || echo "!! 网络 DNS 全部不可用 (UDP 53 被拦截?), 已用公共 DNS 兜底继续启动" >&2
+            fi
             exec proot -b "$RESOLV_CONF:/etc/resolv.conf" node "$REAL_JS" "$@"
         else
             echo "未检测到 root 且缺少 proot, 请先安装: pkg install proot" >&2
