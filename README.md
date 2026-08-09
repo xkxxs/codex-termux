@@ -17,6 +17,7 @@
 > 监听该端口，并**自动探测手机当前 DNS（运营商下发）优先转发**，公共 DNS 兜底；没有 root 时无法绑定特权端口 53，改用 `dns-bootstrap.js`
 > 实测校验器：逐个探测候选 DNS 的应答质量，只把真实可用的写进 `resolv.conf`，再交给 proot 绑定给 musl 读取。
 > dns53 / dns-bootstrap 都会**校验上游应答**：SERVFAIL / 无答案 / 只回 CNAME 不给 A 记录（国内 ISP 常见过滤手法）都会自动跳过换下一个上游，连续异常的上游自动降级（dns-bootstrap 每 60 秒重测重写）——在外切换 WiFi/基站也不用管。
+> dns53 的最终防线是 **netd 兜底**：当所有 UDP 上游都被当前网络拦截（运营商封锁 UDP 53 时常见）时，自动改用系统级解析（bionic → netd）应答，保证 API 域名始终可解析。
 > 注意：无 root 时若网络禁止普通 App 直连公网 DNS 53 端口，dns-bootstrap 会明确报错提示（不再静默卡 5 秒），此时仍需 root 方案。
 
 ## 为什么选这个方案？

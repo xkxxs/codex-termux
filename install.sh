@@ -387,7 +387,7 @@ const PUBLIC_DNS = [
   ['119.29.29.29', 53],   // 腾讯
   ['114.114.114.114', 53],// 114
 ];
-const TIMEOUT_MS = 2000;
+const TIMEOUT_MS = 1500;
 // 固定路径: sudo 运行时 HOME 会变成 .suroot, 不能用 HOME 推导
 const LOG = process.env.DNS53_LOG || '/data/data/com.termux/files/home/.codex/dns53.log';
 const log = (m) => { try { fs.appendFileSync(LOG, `${new Date().toISOString()} ${m}\n`); } catch (_) {} };
@@ -450,19 +450,22 @@ const strikes = new Map();
 const MAX_STRIKES = 3;
 
 // 判断应答是否有效: 返回 true = 应答异常, 应换下一个上游。
-// 覆盖: 报文过短 / SERVFAIL / rcode=0 但答案为空 / 查询 A(AAAA) 却只回 CNAME 没给 A(AAAA)
+// 覆盖: 报文过短 / SERVFAIL / A 查询 rcode=0 但答案为空 / A 查询只回 CNAME 没给 A
 //       (中国 ISP DNS 常见过滤手法: 剥离 CNAME 链末端的地址记录)。
+// 注意: AAAA 查询 (qtype=28) 一律放行 —— 域名没有 IPv6 记录时 NOERROR+0 答案、
+//       部分上游对 AAAA 返回 NOTIMP 都是正常现象, 应由客户端自行回退 A 记录。
 function isBadResponse(resp, qtype) {
   if (resp.length < 12) return true;
   const flags = resp.readUInt16BE(2);
   const rcode = flags & 0x0f;
   if (rcode === 2) return true; // SERVFAIL
-  if (rcode !== 0) return false; // NXDOMAIN 等是合法应答, 正常转发
+  if (qtype === 28) return false; // AAAA: 空/NOTIMP/CNAME-only 均合法, 不判坏
+  if (rcode !== 0 && rcode !== 3) return true; // NOTIMP/REFUSED 等 → 判坏换上游
   const qd = resp.readUInt16BE(4);
   const an = resp.readUInt16BE(6);
-  if (an === 0) return true; // rcode=0 但无任何答案 = 被过滤
-  if (qtype !== 1 && qtype !== 28) return false; // 非 A/AAAA 查询, 只做基本校验
-  // 逐条解析答案区, 看是否含有 A/AAAA 记录
+  if (an === 0) return true; // A 查询 rcode=0 但无任何答案 = 被过滤
+  if (qtype !== 1) return false; // 非 A 查询, 只做基本校验
+  // 逐条解析答案区, 看是否含有 A 记录
   let off = 12;
   const skipName = (p) => {
     let hops = 0;
@@ -479,9 +482,9 @@ function isBadResponse(resp, qtype) {
     const type = resp.readUInt16BE(off);
     const len = resp.readUInt16BE(off + 8);
     off += 10 + len;
-    if (type === 1 || type === 28) return false; // 找到 A/AAAA, 应答有效
+    if (type === 1) return false; // 找到 A 记录, 应答有效
   }
-  return true; // 答案区只有 CNAME/NS 等, 没有地址记录
+  return true; // A 查询答案区只有 CNAME/NS 等, 没有地址记录
 }
 
 // 降级: 把 host 移到列表末尾, 下次刷新会按新的手机 DNS 顺序重建
@@ -494,39 +497,160 @@ function demote(host) {
   }
 }
 
+// 从查询报文解析 qtype (跳过问题名, 不受 EDNS 附加区影响)
+function queryType(msg) {
+  if (msg.length < 16) return 0;
+  let off = 12;
+  let hops = 0;
+  while (off < msg.length && msg[off] !== 0) {
+    if ((msg[off] & 0xc0) === 0xc0) return 0; // 压缩指针不出现于查询
+    off += msg[off] + 1;
+    if (++hops > 32) return 0;
+  }
+  if (off >= msg.length) return 0;
+  off++; // root label
+  if (off + 4 > msg.length) return 0;
+  return (msg[off] << 8) | msg[off + 1];
+}
+
+// 从查询报文解析域名 (与 queryType 共用同一套偏移, 保证一致性)
+function queryName(msg) {
+  if (msg.length < 12) return null;
+  let off = 12;
+  let name = '';
+  while (off < msg.length && msg[off] !== 0) {
+    const len = msg[off++];
+    if (off + len > msg.length) return null;
+    name += (name ? '.' : '') + msg.slice(off, off + len).toString();
+    off += len;
+  }
+  if (off >= msg.length) return null;
+  return name;
+}
+
+// IPv6 地址字符串 → 16 字节 (处理 :: 简写与 IPv4 内嵌)
+function ipv6ToBytes(ip) {
+  const buf = Buffer.alloc(16);
+  const v4m = ip.match(/(.*):([0-9.]+)$/);
+  let head, tail;
+  if (v4m && v4m[2].includes('.')) {
+    head = v4m[1]; tail = v4m[2].split('.').map(Number);
+  } else {
+    head = ip; tail = [];
+  }
+  const [hs, ts] = head.split('::');
+  let h = hs ? hs.split(':').filter(Boolean) : [];
+  const t = ts ? ts.split(':').filter(Boolean) : [];
+  while (h.length + t.length + (tail.length ? 2 : 0) < 8) h.push('0');
+  const all = h.concat(t);
+  all.forEach((part, i) => { if (part !== undefined) buf.writeUInt16BE(parseInt(part, 16) || 0, i * 2); });
+  if (tail.length) {
+    tail.forEach((b, i) => { buf.writeUInt8(b, 12 + i); });
+  }
+  return buf;
+}
+
+// 构造 DNS 应答: 复用客户端查询报文, 填上答案
+function buildResponse(msg, answers) {
+  const qnameLen = msg.length - 12;
+  const resp = Buffer.alloc(12 + qnameLen + answers.length * 16);
+  msg.copy(resp, 0, 0, 12 + qnameLen);
+  resp[2] |= 0x80; // QR
+  resp[3] |= 0x80; // RA
+  resp[6] = answers.length >> 8; resp[7] = answers.length & 0xff;
+  let off = 12 + qnameLen;
+  for (const a of answers) {
+    resp.writeUInt16BE(0xc00c, off); off += 2; // 指针 → 问题名
+    resp.writeUInt16BE(a.type, off); off += 2;
+    resp.writeUInt16BE(1, off); off += 2;      // IN
+    resp.writeUInt32BE(60, off); off += 4;     // TTL
+    if (a.type === 1) {
+      resp.writeUInt16BE(4, off); off += 2;
+      for (const b of a.ip.split('.').map(Number)) resp.writeUInt8(b, off++);
+    } else {
+      resp.writeUInt16BE(16, off); off += 2;
+      ipv6ToBytes(a.ip).copy(resp, off); off += 16;
+    }
+  }
+  return resp;
+}
+
+const netd = require('dns'); // node 内置解析 (走 bionic/netd, 不受 UDP 53 封锁影响)
+
+// 最后兜底: UDP 上游失败时, 用系统解析 (netd) 回答 (onDone 通知调用方)
+function netdFallback(msg, rinfo, qtype, onDone) {
+  const host = queryName(msg);
+  if (!host || (qtype !== 1 && qtype !== 28)) {
+    log('netd fallback: unsupported query');
+    return;
+  }
+  const family = qtype === 1 ? 4 : 6;
+  netd.lookup(host, { family, timeout: 5000 }, (err, ip) => {
+    if (onDone) onDone();
+    if (err) {
+      // NXDOMAIN 或解析失败: 回 rcode=3 (合法应答, 客户端正常处理)
+      const resp = Buffer.alloc(12 + msg.length - 12);
+      msg.copy(resp, 0, 0, msg.length);
+      resp[2] |= 0x80; // QR
+      resp[3] = (resp[3] & 0x70) | 0x80 | 0x03; // RA + rcode=NXDOMAIN
+      server.send(resp, rinfo.port, rinfo.address);
+      log(`netd fallback: ${host} → NXDOMAIN/err ${err.code || err.message}`);
+      return;
+    }
+    const resp = buildResponse(msg, [{ type: qtype, ip }]);
+    server.send(resp, rinfo.port, rinfo.address);
+    log(`netd fallback: ${host} → ${ip} (${family === 4 ? 'A' : 'AAAA'})`);
+  });
+}
+
 const server = dgram.createSocket('udp4');
 
 server.on('message', (msg, rinfo) => {
-  const qtype = msg.length >= 4 ? (msg[msg.length - 4] << 8) | msg[msg.length - 3] : 0;
+  const qtype = queryType(msg);
+  let done = false;
+  let netdStarted = false;
+  // 任一上游失败 → 立即启动 netd 兜底 (netd 与上游竞争, 先回先赢, done 防双发)
+  const startNetd = () => {
+    if (netdStarted || done) return;
+    netdStarted = true;
+    netdFallback(msg, rinfo, qtype, () => { done = true; });
+  };
   let i = 0;
   const tryNext = () => {
-    if (i >= UPSTREAMS.length) return; // 全部失败, 静默丢弃
+    if (done) return;
+    if (i >= UPSTREAMS.length) { startNetd(); return; }
     const [host, port] = UPSTREAMS[i++];
     const sock = dgram.createSocket('udp4');
-    let done = false;
-    const timer = setTimeout(() => {
-      if (!done) { done = true; sock.close(); log(`timeout ${host}, retry`); tryNext(); }
-    }, TIMEOUT_MS);
+    let doneHere = false;
+    const finish = (fn) => {
+      if (doneHere) return;
+      doneHere = true;
+      clearTimeout(timer);
+      sock.close();
+      fn();
+    };
+    const timer = setTimeout(() => finish(() => { log(`timeout ${host}, retry`); startNetd(); }), TIMEOUT_MS);
     sock.on('message', (resp) => {
-      if (done) return;
+      if (doneHere) return;
       if (isBadResponse(resp, qtype)) {
-        done = true; clearTimeout(timer); sock.close();
-        const n = (strikes.get(host) || 0) + 1;
-        strikes.set(host, n);
-        if (n >= MAX_STRIKES) { strikes.delete(host); demote(host); }
-        log(`bad response from ${host}, retry`);
-        tryNext();
+        finish(() => {
+          const n = (strikes.get(host) || 0) + 1;
+          strikes.set(host, n);
+          if (n >= MAX_STRIKES) { strikes.delete(host); demote(host); }
+          log(`bad response from ${host}, retry`);
+          startNetd();
+        });
         return;
       }
-      done = true; clearTimeout(timer); sock.close();
-      if (strikes.has(host)) strikes.delete(host);
-      server.send(resp, rinfo.port, rinfo.address);
+      finish(() => {
+        if (strikes.has(host)) strikes.delete(host);
+        done = true;
+        server.send(resp, rinfo.port, rinfo.address);
+      });
     });
-    sock.on('error', (e) => {
-      if (!done) { done = true; clearTimeout(timer); sock.close(); log(`error ${host}: ${e.message}`); tryNext(); }
-    });
+    sock.on('error', (e) => finish(() => { log(`error ${host}: ${e.message}`); startNetd(); }));
     sock.send(msg, port, host, (e) => {
-      if (e && !done) { done = true; clearTimeout(timer); sock.close(); tryNext(); }
+      if (e) finish(() => startNetd());
     });
   };
   tryNext();
