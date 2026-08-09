@@ -255,9 +255,59 @@ function refreshDns() {
   }
 }
 
+// 连续空应答计数: 记录各上游的连续"被过滤"次数, 达到阈值后降级到底部
+const strikes = new Map();
+const MAX_STRIKES = 3;
+
+// 判断应答是否有效: 返回 true = 应答异常, 应换下一个上游。
+// 覆盖: 报文过短 / SERVFAIL / rcode=0 但答案为空 / 查询 A(AAAA) 却只回 CNAME 没给 A(AAAA)
+//       (中国 ISP DNS 常见过滤手法: 剥离 CNAME 链末端的地址记录)。
+function isBadResponse(resp, qtype) {
+  if (resp.length < 12) return true;
+  const flags = resp.readUInt16BE(2);
+  const rcode = flags & 0x0f;
+  if (rcode === 2) return true; // SERVFAIL
+  if (rcode !== 0) return false; // NXDOMAIN 等是合法应答, 正常转发
+  const qd = resp.readUInt16BE(4);
+  const an = resp.readUInt16BE(6);
+  if (an === 0) return true; // rcode=0 但无任何答案 = 被过滤
+  if (qtype !== 1 && qtype !== 28) return false; // 非 A/AAAA 查询, 只做基本校验
+  // 逐条解析答案区, 看是否含有 A/AAAA 记录
+  let off = 12;
+  const skipName = (p) => {
+    let hops = 0;
+    while (off < p.length && p[off] !== 0) {
+      if ((p[off] & 0xc0) === 0xc0) { off += 2; return; }
+      off += p[off] + 1;
+      if (++hops > 32) break;
+    }
+    off++;
+  };
+  for (let i = 0; i < qd && off < resp.length; i++) { skipName(resp); off += 4; }
+  for (let i = 0; i < an && off + 10 <= resp.length; i++) {
+    skipName(resp);
+    const type = resp.readUInt16BE(off);
+    const len = resp.readUInt16BE(off + 8);
+    off += 10 + len;
+    if (type === 1 || type === 28) return false; // 找到 A/AAAA, 应答有效
+  }
+  return true; // 答案区只有 CNAME/NS 等, 没有地址记录
+}
+
+// 降级: 把 host 移到列表末尾, 下次刷新会按新的手机 DNS 顺序重建
+function demote(host) {
+  const idx = UPSTREAMS.findIndex((s) => s[0] === host);
+  if (idx > 0) {
+    const [s] = UPSTREAMS.splice(idx, 1);
+    UPSTREAMS.push(s);
+    log(`demoted bad upstream ${host}`);
+  }
+}
+
 const server = dgram.createSocket('udp4');
 
 server.on('message', (msg, rinfo) => {
+  const qtype = msg.length >= 4 ? (msg[msg.length - 4] << 8) | msg[msg.length - 3] : 0;
   let i = 0;
   const tryNext = () => {
     if (i >= UPSTREAMS.length) return; // 全部失败, 静默丢弃
@@ -269,7 +319,17 @@ server.on('message', (msg, rinfo) => {
     }, TIMEOUT_MS);
     sock.on('message', (resp) => {
       if (done) return;
+      if (isBadResponse(resp, qtype)) {
+        done = true; clearTimeout(timer); sock.close();
+        const n = (strikes.get(host) || 0) + 1;
+        strikes.set(host, n);
+        if (n >= MAX_STRIKES) { strikes.delete(host); demote(host); }
+        log(`bad response from ${host}, retry`);
+        tryNext();
+        return;
+      }
       done = true; clearTimeout(timer); sock.close();
+      if (strikes.has(host)) strikes.delete(host);
       server.send(resp, rinfo.port, rinfo.address);
     });
     sock.on('error', (e) => {
