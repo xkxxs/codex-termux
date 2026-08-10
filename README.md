@@ -18,6 +18,8 @@
 > 实测校验器：逐个探测候选 DNS 的应答质量，只把真实可用的写进 `resolv.conf`，再交给 proot 绑定给 musl 读取。
 > dns53 / dns-bootstrap 都会**校验上游应答**：SERVFAIL / 无答案 / 只回 CNAME 不给 A 记录（国内 ISP 常见过滤手法）都会自动跳过换下一个上游，连续异常的上游自动降级（dns-bootstrap 每 60 秒重测重写）——在外切换 WiFi/基站也不用管。
 > dns53 的最终防线是 **netd 兜底**：当所有 UDP 上游都被当前网络拦截（运营商封锁 UDP 53 时常见）时，自动改用系统级解析（bionic → netd）应答，保证 API 域名始终可解析。
+> dns53 会**屏蔽 AAAA 应答**（`DNS53_DISABLE_AAAA=0` 可关闭）：家庭宽带 IPv6 常见"黑洞"（光猫拿到 240e 前缀但出站无路由，光猫诊断页 ping6 公网 100% 丢包），Go/musl 客户端拿到 AAAA 后会优先尝试 IPv6 连接并卡死超时——屏蔽后客户端自动纯走 IPv4，规避 IPv6 黑洞。
+> 诊断工具：`bash ~/.check_dns.sh` 一键判断"DNS 问题 vs 网络问题 vs 服务器问题"（dns53 状态 + 各域名解析 + HTTPS 连通性 + 最近日志）；`node ~/.local/bin/dnsq.js <host>` 单点查询（可自定义域名）。
 > 注意：无 root 时若网络禁止普通 App 直连公网 DNS 53 端口，dns-bootstrap 会明确报错提示（不再静默卡 5 秒），此时仍需 root 方案。
 
 ## 为什么选这个方案？
@@ -63,6 +65,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/xkxxs/codex-termux/main/inst
 ```bash
 codex                     # 启动：先检查最新版，非最新自动更新再启动（已最新直接启动）
 codex update              # 手动强制更新到最新版
+bash ~/.check_dns.sh      # DNS 一键诊断（解析 + 连通性 + 日志，见"常见问题"）
+node ~/.local/bin/dnsq.js api.deepseek.com   # 单点解析测试
 bash <(curl -fsSL …/install.sh)              # 重跑即更新（幂等）
 bash <(curl -fsSL …/install.sh) --uninstall  # 卸载
 ```
@@ -84,6 +88,15 @@ bash <(curl -fsSL …/install.sh) --uninstall  # 卸载
 | 证书缺失 | curl 正常但 codex 失败 | 本脚本已设置 `SSL_CERT_FILE` |
 
 有 root 时走 dns53 原生方案（需要手机已 root/Magisk 且 Termux 的 `sudo` 可用，脚本自动 `pkg install sudo`）；没有 root 时脚本自动改用 dns-bootstrap + proot 兜底（自动 `pkg install proot`），无需 root 也能正常解析。dns53 会自动探测并优先使用手机当前下发的 DNS（运营商 DNS），公共 DNS 兜底。dns-bootstrap 每次启动前实测公网候选 DNS 应答质量（SERVFAIL/空应答/CNAME-only 判废），只把可用的写进 `resolv.conf`，常驻进程每 60 秒重测重写，切 WiFi/基站自动跟随；若当前网络禁止直连公网 DNS 53 端口，它会明确报错而不是静默卡 5 秒。
+
+**API 时好时坏 / 切换网络后连不上？** 先跑 `bash ~/.check_dns.sh` 三秒定位：
+
+| 结果 | 结论 |
+|---|---|
+| 解析 OK + HTTPS 有响应（401/404/200） | 网络、DNS、服务器全正常 → 是旧进程持有切网络前的 DNS 缓存，重开 codex/opencode |
+| 解析 ★ 失败/TIMEOUT | DNS 链挂了 → 看 `~/.codex/dns53.log` 尾部 + 重开终端（自动拉起 dns53） |
+| 解析 OK 但 HTTPS ★ 超时 | 出站被网络挡了（切 WiFi/基站，或运营商干扰特定站点） |
+| HTTPS 5xx/∞ | 服务器侧问题 |
 
 ## 配置模型（DeepSeek 等）
 

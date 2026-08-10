@@ -388,9 +388,29 @@ const PUBLIC_DNS = [
   ['114.114.114.114', 53],// 114
 ];
 const TIMEOUT_MS = 1500;
+// 屏蔽 AAAA: Termux 环境下 IPv6 基本不可用 (电信 WLAN 常见 IPv6 黑洞:
+// 有地址但出站丢包), Go/musl 客户端拿到 AAAA 后优先尝试 IPv6 → 卡死超时。
+// 对 AAAA 返回"无记录", 客户端自动回落 IPv4。可用 DNS53_DISABLE_AAAA=0 关闭。
+const DISABLE_AAAA = process.env.DNS53_DISABLE_AAAA !== '0';
 // 固定路径: sudo 运行时 HOME 会变成 .suroot, 不能用 HOME 推导
 const LOG = process.env.DNS53_LOG || '/data/data/com.termux/files/home/.codex/dns53.log';
-const log = (m) => { try { fs.appendFileSync(LOG, `${new Date().toISOString()} ${m}\n`); } catch (_) {} };
+const log = (m) => {
+  try {
+    fs.appendFileSync(LOG, `${new Date().toISOString()} ${m}\n`);
+  } catch (_) {}
+};
+// 日志轮转: 超过 2MB 截掉前半 (调试期高频查询日志会涨)
+function rotateLog() {
+  try {
+    const st = fs.statSync(LOG);
+    if (st.size > 2 * 1024 * 1024) {
+      const content = fs.readFileSync(LOG, 'utf8');
+      fs.writeFileSync(LOG, content.slice(Math.floor(content.length / 2)));
+      log('LOG ROTATED');
+    }
+  } catch (_) {}
+}
+setInterval(rotateLog, 60000);
 
 let UPSTREAMS = [...PUBLIC_DNS];
 
@@ -578,13 +598,15 @@ function buildResponse(msg, answers) {
 const netd = require('dns'); // node 内置解析 (走 bionic/netd, 不受 UDP 53 封锁影响)
 
 // 最后兜底: UDP 上游失败时, 用系统解析 (netd) 回答 (onDone 通知调用方)
-function netdFallback(msg, rinfo, qtype, onDone) {
+function netdFallback(msg, rinfo, qtype, onDone, qid) {
   const host = queryName(msg);
   if (!host || (qtype !== 1 && qtype !== 28)) {
-    log('netd fallback: unsupported query');
+    log(`netd fallback q${qid}: unsupported query (qtype=${qtype})`);
+    if (onDone) onDone();
     return;
   }
   const family = qtype === 1 ? 4 : 6;
+  const t1 = Date.now();
   netd.lookup(host, { family, timeout: 5000 }, (err, ip) => {
     if (onDone) onDone();
     if (err) {
@@ -594,12 +616,12 @@ function netdFallback(msg, rinfo, qtype, onDone) {
       resp[2] |= 0x80; // QR
       resp[3] = (resp[3] & 0x70) | 0x80 | 0x03; // RA + rcode=NXDOMAIN
       server.send(resp, rinfo.port, rinfo.address);
-      log(`netd fallback: ${host} → NXDOMAIN/err ${err.code || err.message}`);
+      log(`netd fallback q${qid} ${host} → NXDOMAIN/err ${err.code || err.message} (${Date.now() - t1}ms)`);
       return;
     }
     const resp = buildResponse(msg, [{ type: qtype, ip }]);
     server.send(resp, rinfo.port, rinfo.address);
-    log(`netd fallback: ${host} → ${ip} (${family === 4 ? 'A' : 'AAAA'})`);
+    log(`netd fallback q${qid} ${host} → ${ip} (${family === 4 ? 'A' : 'AAAA'}) ${Date.now() - t1}ms`);
   });
 }
 
@@ -607,19 +629,36 @@ const server = dgram.createSocket('udp4');
 
 server.on('message', (msg, rinfo) => {
   const qtype = queryType(msg);
+  const qid = msg.readUInt16BE(0).toString(16);
+  const qhost = queryName(msg) || '?';
+  const t0 = Date.now();
+  log(`>> q${qid} ${qhost} type=${qtype === 1 ? 'A' : qtype === 28 ? 'AAAA' : qtype} from ${rinfo.address}`);
+  // AAAA 屏蔽: 直接回 NOERROR+0 答案 (合法"无 IPv6 记录"), 不走上游
+  if (qtype === 28 && DISABLE_AAAA) {
+    const resp = Buffer.alloc(msg.length);
+    msg.copy(resp, 0, 0, msg.length);
+    resp[2] |= 0x80; // QR
+    resp[3] |= 0x80; // RA
+    server.send(resp, rinfo.port, rinfo.address);
+    log(`<< q${qid} ${qhost} AAAA suppressed (IPv6 disabled) ${Date.now() - t0}ms`);
+    return;
+  }
   let done = false;
   let netdStarted = false;
   // 任一上游失败 → 立即启动 netd 兜底 (netd 与上游竞争, 先回先赢, done 防双发)
   const startNetd = () => {
     if (netdStarted || done) return;
     netdStarted = true;
-    netdFallback(msg, rinfo, qtype, () => { done = true; });
+    log(`>> q${qid} netd fallback started (${Date.now() - t0}ms in)`);
+    netdFallback(msg, rinfo, qtype, () => { done = true; }, qid);
   };
   let i = 0;
   const tryNext = () => {
     if (done) return;
     if (i >= UPSTREAMS.length) { startNetd(); return; }
     const [host, port] = UPSTREAMS[i++];
+    const t1 = Date.now();
+    const tag = `q${qid}->${host}`;
     const sock = dgram.createSocket('udp4');
     let doneHere = false;
     const finish = (fn) => {
@@ -629,7 +668,7 @@ server.on('message', (msg, rinfo) => {
       sock.close();
       fn();
     };
-    const timer = setTimeout(() => finish(() => { log(`timeout ${host}, retry`); startNetd(); }), TIMEOUT_MS);
+    const timer = setTimeout(() => finish(() => { log(`timeout ${tag} (${Date.now() - t1}ms)`); startNetd(); }), TIMEOUT_MS);
     sock.on('message', (resp) => {
       if (doneHere) return;
       if (isBadResponse(resp, qtype)) {
@@ -637,7 +676,7 @@ server.on('message', (msg, rinfo) => {
           const n = (strikes.get(host) || 0) + 1;
           strikes.set(host, n);
           if (n >= MAX_STRIKES) { strikes.delete(host); demote(host); }
-          log(`bad response from ${host}, retry`);
+          log(`bad response ${tag} (${Date.now() - t1}ms, strike ${n}/${MAX_STRIKES})`);
           startNetd();
         });
         return;
@@ -646,11 +685,12 @@ server.on('message', (msg, rinfo) => {
         if (strikes.has(host)) strikes.delete(host);
         done = true;
         server.send(resp, rinfo.port, rinfo.address);
+        log(`<< q${qid} ${qhost} OK via ${host} (${Date.now() - t1}ms, total ${Date.now() - t0}ms)`);
       });
     });
-    sock.on('error', (e) => finish(() => { log(`error ${host}: ${e.message}`); startNetd(); }));
+    sock.on('error', (e) => finish(() => { log(`error ${tag}: ${e.message} (${Date.now() - t1}ms)`); startNetd(); }));
     sock.send(msg, port, host, (e) => {
-      if (e) finish(() => startNetd());
+      if (e) finish(() => { log(`send error ${tag}: ${e.message}`); startNetd(); });
     });
   };
   tryNext();
@@ -659,6 +699,8 @@ server.on('message', (msg, rinfo) => {
 server.on('error', (e) => {
   log(`server error: ${e.message}`);
   if (process.stderr.isTTY) console.error(`dns53 server error: ${e.message}`);
+  // 端口被占等致命错误: 占着没意义, 直接退出 (避免僵尸进程)
+  process.exit(1);
 });
 server.bind(53, '127.0.0.1', () => {
   refreshDns();
@@ -666,6 +708,7 @@ server.bind(53, '127.0.0.1', () => {
   if (process.stdout.isTTY) console.log('dns53 listening on 127.0.0.1:53');
   setInterval(refreshDns, 60000);
 });
+
 DNS53_EOF
         chmod +x "$dns53"
         info "dns53.js 已更新: $dns53"
@@ -694,6 +737,62 @@ BASHRC_EOF
     else
         ok "DNS 转发器已在运行"
     fi
+
+    # 诊断工具: 一键区分 DNS / 网络 / 服务器问题
+    local dnsq="$HOME_DIR/.local/bin/dnsq.js"
+    local check="$HOME_DIR/.check_dns.sh"
+    cat > "$dnsq" << 'DNSQ_EOF'
+#!/usr/bin/env node
+// dnsq.js — 经 127.0.0.1:53 (dns53 转发链) 查询域名 A 记录
+// 用法: node dnsq.js <host>
+const { Resolver } = require('dns').promises;
+const host = process.argv[2];
+if (!host) { console.error('usage: node dnsq.js <host>'); process.exit(2); }
+const r = new Resolver({ servers: ['127.0.0.1'], timeout: 3000, retries: 0 });
+const t0 = Date.now();
+r.resolve4(host).then((ips) => {
+  console.log(`  ${host} → OK IPs=[${ips.join(',')}] (${Date.now() - t0}ms)`);
+  process.exit(0);
+}).catch((e) => {
+  console.log(`  ${host} → ★ ${e.code || 'ERR'} (${Date.now() - t0}ms)`);
+  process.exit(1);
+});
+DNSQ_EOF
+    cat > "$check" << 'CHECK_EOF'
+#!/usr/bin/env bash
+# check_dns.sh — 一键判断"DNS 问题 vs 网络/服务器问题"
+# 用法: bash ~/.check_dns.sh [域名...]
+DNSQ=/data/data/com.termux/files/home/.local/bin/dnsq.js
+LOG=/data/data/com.termux/files/home/.codex/dns53.log
+HOSTS=(api.deepseek.com integrate.api.nvidia.com opencode.ai www.baidu.com)
+[ $# -gt 0 ] && HOSTS=("$@")
+
+echo "═══ 诊断 $(date '+%F %T') ═══"
+
+echo "── dns53 状态 ──"
+if sudo -n ss -ulnp 2>/dev/null | grep -q "127.0.0.1:53"; then
+  echo "运行中"
+else
+  echo "★ 未运行! 请重开终端或手动: sudo nohup node ~/.local/bin/dns53.js &"
+fi
+grep 'dns servers:' "$LOG" 2>/dev/null | tail -1 || echo "(无日志)"
+
+echo "── 域名解析 (经 127.0.0.1:53 / dns53 转发) ──"
+for h in "${HOSTS[@]}"; do
+  timeout 6 node "$DNSQ" "$h" || true
+done
+
+echo "── HTTPS 连通性 ──"
+for u in https://api.deepseek.com/v1 https://integrate.api.nvidia.com/v1 https://opencode.ai https://www.baidu.com; do
+  printf "  %s → " "$u"
+  curl -s -o /dev/null -w "%{http_code} %{time_total}s\n" --max-time 8 "$u" || echo "★ 超时/失败"
+done
+
+echo "── 最近 12 条 dns53 日志 ──"
+tail -12 "$LOG" 2>/dev/null || echo "无日志文件"
+CHECK_EOF
+    chmod +x "$dnsq" "$check"
+    ok "诊断工具已安装: ~/.check_dns.sh (用法: bash ~/.check_dns.sh)"
 }
 
 # ---------- 安装官方 Codex ----------
