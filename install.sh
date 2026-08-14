@@ -122,7 +122,7 @@ fix_mirror() {
     } > "$sources_file"
     info "已切换 (原配置已备份: sources.list.bak.*)"
 
-    if apt update -y >/dev/null 2>&1; then
+    if DEBIAN_FRONTEND=noninteractive apt update -y; then
         ok "apt update 成功 ($best)"
     else
         warn "apt update 失败, 请手动检查: pkg change-repo"
@@ -131,9 +131,13 @@ fix_mirror() {
 
 # ---------- 全量升级 ----------
 # 换好源后把所有软件包升到最新 (幂等: 已最新则跳过)
+# ⚠️ 不要重定向输出到 /dev/null: 全新 Termux 首次升级要下载几百 MB,
+#    无输出会看起来像"卡死" (实际在下载), 用户会误以为卡住而 Ctrl+C。
+#    DEBIAN_FRONTEND=noninteractive 避免 dpkg conffile 提问在管道里静默卡住。
 upgrade_packages() {
     info "更新软件包索引并升级全部软件包…"
-    if pkg upgrade -y >/dev/null 2>&1; then
+    info "提示: 全新 Termux 首次升级可能耗时数分钟 (下载量大), 请耐心等待, 不要打断"
+    if DEBIAN_FRONTEND=noninteractive pkg upgrade -y; then
         ok "软件包已是最新"
     else
         warn "pkg upgrade 未完全成功, 请稍后重试 (pkg upgrade -y)"
