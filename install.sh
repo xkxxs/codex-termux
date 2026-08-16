@@ -393,7 +393,7 @@ const PUBLIC_DNS4 = [
 ];
 const PUBLIC_DNS6 = [
   ['2400:3200::1', 53],   // 阿里 IPv6
-  ['240c::6666', 53],     // CNNIC IPv6
+  ['2402:4e00::', 53],    // 腾讯 DNSPod IPv6
   ['2408:8899::8', 53],   // 移动 IPv6
 ];
 const TIMEOUT_MS = 1500;
