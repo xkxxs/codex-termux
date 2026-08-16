@@ -721,6 +721,53 @@ server.bind(53, '127.0.0.1', () => {
 DNS53_EOF
         chmod +x "$dns53"
         info "dns53.js 已更新: $dns53"
+        cat > "$HOME_DIR/.local/bin/dns53-aaaa" << 'AAAA_EOF'
+#!/data/data/com.termux/files/usr/bin/bash
+# dns53-aaaa — 一键切换 dns53 的 AAAA 屏蔽
+# 用法: dns53-aaaa on|off|status
+set -euo pipefail
+
+D53="$HOME/.local/bin/dns53.js"
+LOG="$HOME/.codex/dns53.log"
+
+get_pid() {
+  sudo -n pgrep -f '^node .*dns5[3]\.js' 2>/dev/null | head -1
+}
+
+show_status() {
+  local pid mode
+  pid=$(get_pid)
+  if [ -z "$pid" ]; then
+    echo "dns53 未运行"
+    return
+  fi
+  mode=$(sudo -n cat "/proc/$pid/environ" 2>/dev/null | tr '\0' '\n' | sed -n 's/^DNS53_DISABLE_AAAA=//p')
+  if [ "$mode" = "0" ]; then
+    echo "关闭（放行 AAAA/IPv6）| PID $pid"
+  else
+    echo "开启（屏蔽 AAAA，只走 IPv4）| PID $pid"
+  fi
+}
+
+restart() {
+  local val="$1" label="$2"
+  sudo -n pkill -f '^node .*dns5[3]\.js' 2>/dev/null || true
+  sleep 1
+  sudo -n env DNS53_DISABLE_AAAA="$val" nohup node "$D53" > "$LOG" 2>&1 &
+  sleep 1
+  echo "✓ $label"
+  show_status
+}
+
+case "${1:-status}" in
+  on)  restart 1 "AAAA 屏蔽已开启（默认，只走 IPv4）" ;;
+  off) restart 0 "AAAA 屏蔽已关闭（放行 IPv6）" ;;
+  status) show_status ;;
+  *) echo "用法: dns53-aaaa on|off|status" >&2; exit 1 ;;
+esac
+AAAA_EOF
+        chmod +x "$HOME_DIR/.local/bin/dns53-aaaa"
+        info "dns53-aaaa 切换脚本已生成: ~/.local/bin/dns53-aaaa"
 
     if ! grep -q 'dns53' "$HOME_DIR/.bashrc" 2>/dev/null; then
         cat >> "$HOME_DIR/.bashrc" << 'BASHRC_EOF'
