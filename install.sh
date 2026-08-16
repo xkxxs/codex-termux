@@ -190,7 +190,7 @@ const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
 
-const PUBLIC_DNS = ['223.5.5.5', '119.29.29.29', '114.114.114.114'];
+const PUBLIC_DNS = ['223.5.5.5', '119.29.29.29', '114.114.114.114', '2400:3200::1', '2402:4e00::'];
 // 测速用域名: 主测 API 域名; 若主域名本身被网络过滤, 回退测国内域名判断网络是否可用
 const PROBE_DOMAINS = ['api.deepseek.com', 'www.baidu.com'];
 const TIMEOUT_MS = 2500;
@@ -236,7 +236,7 @@ function discoverPhoneDns() {
 // DNS 查询 (UDP 53, 非特权端口即可发起)
 function queryDNS(server, host, timeout = TIMEOUT_MS) {
   return new Promise((resolve) => {
-    const sock = dgram.createSocket('udp4');
+    const sock = dgram.createSocket(server.includes(':') ? 'udp6' : 'udp4');
     const id = Buffer.from([Math.floor(Math.random() * 256), Math.floor(Math.random() * 256)]);
     const q = Buffer.alloc(12 + 2 + host.length + 4);
     id.copy(q, 0);
@@ -315,7 +315,7 @@ async function runOnce() {
   const top = good.slice(0, 3);
   const body = top.length
     ? top.map((r) => `nameserver ${r.ip}`).join('\n') + '\n'
-    : 'nameserver 223.5.5.5\nnameserver 119.29.29.29\n';
+    : 'nameserver 223.5.5.5\nnameserver 119.29.29.29\nnameserver 2400:3200::1\nnameserver 2402:4e00::\n';
 
   fs.mkdirSync(path.dirname(RESOLV), { recursive: true });
   fs.writeFileSync(RESOLV, `${comment.join('\n')}\n# auto-written by dns-bootstrap.js @ ${new Date().toISOString()}\n${body}`);
@@ -397,10 +397,10 @@ const PUBLIC_DNS6 = [
   ['2408:8899::8', 53],   // 移动 IPv6
 ];
 const TIMEOUT_MS = 1500;
-// AAAA 屏蔽开关 (默认关闭): 境内 IPv6 可用, 让客户端正常走 IPv6。
-// 遇到境外 IPv6 不可达导致连接卡死时, 设置 DNS53_DISABLE_AAAA=1
-// 对 AAAA 返回"无记录", 强制客户端回落 IPv4。
-const DISABLE_AAAA = process.env.DNS53_DISABLE_AAAA === '1';
+// AAAA 屏蔽开关 (默认开启): 屏蔽后客户端只走 IPv4,
+// 避免境外 IPv6 不可达导致连接卡死 (如 OpenAI 域名)。
+// 境内 IPv6 可用时, 可设 DNS53_DISABLE_AAAA=0 关闭屏蔽。
+const DISABLE_AAAA = process.env.DNS53_DISABLE_AAAA !== '0';
 // 固定路径: sudo 运行时 HOME 会变成 .suroot, 不能用 HOME 推导
 const LOG = process.env.DNS53_LOG || '/data/data/com.termux/files/home/.codex/dns53.log';
 const log = (m) => {
