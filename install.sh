@@ -350,21 +350,6 @@ DNSBOOT_EOF
         chmod +x "$dnsboot"
         info "dns-bootstrap.js 已写入: $dnsboot"
 
-        # 无 root 常驻: 每 60s 重测重写 resolv.conf, 网络切换自动跟随
-        if ! grep -q 'dns-bootstrap' "$HOME_DIR/.bashrc" 2>/dev/null; then
-            cat >> "$HOME_DIR/.bashrc" << 'DNSBOOT_RC_EOF'
-
-# ===== DNS 自动校验常驻 (dns-bootstrap, 无 root 方案) =====
-# 无 root 时由它实测候选公网 DNS 应答质量, 只把真实可用的写进 resolv.conf,
-# 交给 proot 绑定给 musl 读取。每 60s 重测, 切 WiFi/基站自动跟随。
-if ! pgrep -f "dns-bootstrap[.]js.*daemon" > /dev/null 2>&1; then
-    nohup node "$HOME/.local/bin/dns-bootstrap.js" --daemon >> "$HOME/.codex/dns-bootstrap.log" 2>&1 &
-    sleep 1
-fi
-DNSBOOT_RC_EOF
-            info "dns-bootstrap 常驻逻辑已写入 ~/.bashrc"
-        fi
-
         # 立即实测一次并生成 resolv.conf (proot 绑定用)
         node "$dnsboot" || warn "当前网络 DNS 全部不可用 (53 被拦截?), 已回退公共 DNS 写入 resolv.conf"
         info "如需原生直跑方案, 请在 Magisk 中授权 Termux 后重跑本脚本"
