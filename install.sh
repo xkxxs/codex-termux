@@ -379,23 +379,28 @@ DNSBOOT_RC_EOF
 // 背景: musl 程序 (codex/opencode) 解析器读不到 /etc/resolv.conf (Android 没有),
 //       回退到默认 127.0.0.1:53, 而手机上没人监听该端口 → DNS 卡死 → 5s 超时。
 // 方案: 在 127.0.0.1:53 上监听 UDP, 优先转发到手机当前使用的 DNS (延迟更低),
-//       再依次回退到公共 DNS (阿里→腾讯→114), 回传响应。
+//       再依次回退到公共 DNS (IPv4: 阿里/腾讯/114; IPv6: 阿里/CNNIC/移动), 回传响应。
 // 运行: sudo node dns53.js  (53 是特权端口)
 const dgram = require('dgram');
 const fs = require('fs');
 const { execFileSync } = require('child_process');
 
-// 公共兜底 DNS (手机 DNS 探测失败时使用)
-const PUBLIC_DNS = [
+// 公共兜底 DNS (手机 DNS 探测缺失时使用): IPv4 与 IPv6 各自独立
+const PUBLIC_DNS4 = [
   ['223.5.5.5', 53],      // 阿里
   ['119.29.29.29', 53],   // 腾讯
   ['114.114.114.114', 53],// 114
 ];
+const PUBLIC_DNS6 = [
+  ['2400:3200::1', 53],   // 阿里 IPv6
+  ['240c::6666', 53],     // CNNIC IPv6
+  ['2408:8899::8', 53],   // 移动 IPv6
+];
 const TIMEOUT_MS = 1500;
-// 屏蔽 AAAA: Termux 环境下 IPv6 基本不可用 (电信 WLAN 常见 IPv6 黑洞:
-// 有地址但出站丢包), Go/musl 客户端拿到 AAAA 后优先尝试 IPv6 → 卡死超时。
-// 对 AAAA 返回"无记录", 客户端自动回落 IPv4。可用 DNS53_DISABLE_AAAA=0 关闭。
-const DISABLE_AAAA = process.env.DNS53_DISABLE_AAAA !== '0';
+// AAAA 屏蔽开关 (默认关闭): 境内 IPv6 可用, 让客户端正常走 IPv6。
+// 遇到境外 IPv6 不可达导致连接卡死时, 设置 DNS53_DISABLE_AAAA=1
+// 对 AAAA 返回"无记录", 强制客户端回落 IPv4。
+const DISABLE_AAAA = process.env.DNS53_DISABLE_AAAA === '1';
 // 固定路径: sudo 运行时 HOME 会变成 .suroot, 不能用 HOME 推导
 const LOG = process.env.DNS53_LOG || '/data/data/com.termux/files/home/.codex/dns53.log';
 const log = (m) => {
@@ -416,20 +421,23 @@ function rotateLog() {
 }
 setInterval(rotateLog, 60000);
 
-let UPSTREAMS = [...PUBLIC_DNS];
+let UPSTREAMS = [...PUBLIC_DNS4, ...PUBLIC_DNS6];
 
-// 探测手机当前 DNS (优先默认网络的 IPv4 地址)
+// 探测手机当前 DNS: 同时收集 IPv4 与 IPv6 (优先默认网络)
 function discoverPhoneDns() {
-  const servers = [];
+  const v4 = [];
+  const v6 = [];
   try {
     // 老版本 Android: getprop net.*.dnsN
     const props = execFileSync('/system/bin/getprop', [], { encoding: 'utf8', timeout: 3000 });
     for (const line of props.split('\n')) {
-      const m = line.match(/^\[net\.\S+\.dns\d+\]:\s*\[([0-9.]+)\]/);
-      if (m) servers.push(m[1]);
+      const m = line.match(/^\[net\.\S+\.dns\d+\]:\s*\[([0-9a-fA-F:.]+)\]/);
+      if (m) {
+        if (m[1].includes(':')) v6.push(m[1]); else v4.push(m[1]);
+      }
     }
   } catch (_) {}
-  if (servers.length === 0) {
+  if (v4.length === 0 && v6.length === 0) {
     try {
       // 现代 Android: dumpsys connectivity 的 DnsAddresses。
       // 优先默认网络 (TRANSPORT_PRIMARY), 再收集所有 INTERNET+VALIDATED 网络,
@@ -440,29 +448,41 @@ function discoverPhoneDns() {
       for (const b of blocks) {
         const dm = b.match(/DnsAddresses:\s*\[([^\]]*)\]/);
         if (!dm) continue;
-        const re = /(\d{1,3}(?:\.\d{1,3}){3})/g;
-        const ips = [];
-        let hit;
-        while ((hit = re.exec(dm[1]))) ips.push(hit[1]);
-        if (!ips.length) continue;
+        const a4 = [];
+        const a6 = [];
+        for (const token of dm[1].split(/[\s,]+/)) {
+          const ip = token.replace(/^\//, '');
+          if (!ip) continue;
+          if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(ip)) a4.push(ip);
+          else if (/^[0-9a-fA-F:.]+$/.test(ip) && ip.includes(':')) a6.push(ip);
+        }
+        if (!a4.length && !a6.length) continue;
         const score = (b.includes('TRANSPORT_PRIMARY') ? 0 : 1) + (b.includes('INTERNET') && b.includes('VALIDATED') ? 0 : 2);
-        scored.push([score, ips]);
+        scored.push([score, a4, a6]);
       }
       scored.sort((a, b) => a[0] - b[0]);
-      for (const [, ips] of scored) servers.push(...ips);
+      for (const [, a4, a6] of scored) {
+        v4.push(...a4);
+        v6.push(...a6);
+      }
     } catch (_) {}
   }
-  return [...new Set(servers)].filter((ip) => ip !== '127.0.0.1' && ip !== '0.0.0.0');
+  return {
+    v4: [...new Set(v4)].filter((ip) => ip !== '127.0.0.1' && ip !== '0.0.0.0'),
+    v6: [...new Set(v6)].filter((ip) => ip !== '::1' && ip !== '::'),
+  };
 }
 
-// 刷新上游: 手机 DNS 在前, 公共 DNS 兜底 (每分钟一次, 网络切换后自动跟随)
+// 刷新上游: 手机 DNS 在前 (v4/v6 各自), 公共 DNS 兜底 (每分钟一次, 网络切换后自动跟随)
 function refreshDns() {
   const phone = discoverPhoneDns();
-  if (phone.length === 0) return;
+  if (phone.v4.length === 0 && phone.v6.length === 0) return;
   const merged = [];
-  for (const ip of [...phone, ...PUBLIC_DNS.map((s) => s[0])]) {
+  const add = (ip) => {
     if (!merged.some((s) => s[0] === ip)) merged.push([ip, 53]);
-  }
+  };
+  for (const ip of [...phone.v4, ...PUBLIC_DNS4.map((s) => s[0])]) add(ip);
+  for (const ip of [...phone.v6, ...PUBLIC_DNS6.map((s) => s[0])]) add(ip);
   if (JSON.stringify(merged) !== JSON.stringify(UPSTREAMS)) {
     UPSTREAMS = merged;
     log(`dns servers: ${merged.map((s) => s[0]).join(', ')}`);
@@ -663,7 +683,7 @@ server.on('message', (msg, rinfo) => {
     const [host, port] = UPSTREAMS[i++];
     const t1 = Date.now();
     const tag = `q${qid}->${host}`;
-    const sock = dgram.createSocket('udp4');
+    const sock = dgram.createSocket(host.includes(':') ? 'udp6' : 'udp4');
     let doneHere = false;
     const finish = (fn) => {
       if (doneHere) return;

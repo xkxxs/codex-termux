@@ -55,7 +55,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/xkxxs/codex-termux/main/inst
 | 全量升级 | 换好源后 `pkg upgrade -y` 把所有软件包升到最新 |
 | 依赖安装 | `pkg install nodejs-lts patchelf sudo/proot`：有 root 装 sudo，无 root 自动装 proot（已装则跳过） |
 | 证书修复 | `SSL_CERT_FILE` 写入 `~/.bashrc`（musl 二进制不认识 Android CA 路径，否则 API 请求报 `stream disconnected`） |
-| **DNS 修复** | 有 root：`dns53.js` 本地 DNS 转发器 + `.bashrc` 常驻（**自动优先手机当前 DNS**）；无 root：`dns-bootstrap.js` 实测校验候选 DNS 后写入 `resolv.conf` + proot 绑定 + `.bashrc` 常驻（每 60s 重测）。**Android 没有 `/etc/resolv.conf`**，musl 解析器回退 `127.0.0.1:53`（无人监听）→ 每次请求卡满 5s 超时，报 `error sending request`。两套方案都会校验应答质量并跳过被过滤的上游 |
+| **DNS 修复** | 有 root：`dns53.js` 本地 DNS 转发器 + `.bashrc` 常驻（**自动优先手机当前 DNS，IPv4/IPv6 独立探测、缺失时公共 DNS 兜底；AAAA 默认不屏蔽，可用 `DNS53_DISABLE_AAAA=1` 开启屏蔽**）；无 root：`dns-bootstrap.js` 实测校验候选 DNS 后写入 `resolv.conf` + proot 绑定 + `.bashrc` 常驻（每 60s 重测）。**Android 没有 `/etc/resolv.conf`**，musl 解析器回退 `127.0.0.1:53`（无人监听）→ 每次请求卡满 5s 超时，报 `error sending request`。两套方案都会校验应答质量并跳过被过滤的上游 |
 | 安装 Codex | `npm install -g @openai/codex@latest` + 手动解压 `-linux-arm64` tarball 到 vendor |
 | 生成 wrapper | `~/.local/bin/codex`：**启动前自动检查最新版，非最新自动更新再启动**（可 `CODEX_NO_AUTO_UPDATE=1` 跳过）、固定 `version.json` 防假升级循环、注入证书、自动拉起 dns53、`codex update` 手动强制升级流程 |
 | 验证 | `codex --version` |
@@ -87,7 +87,7 @@ bash <(curl -fsSL …/install.sh) --uninstall  # 卸载
 | DNS 卡死 | 每次请求**恰好卡 5 秒**后失败（重试 5 次共 ~36s） | 有 root：已装 dns53 转发器；无 root：已装 dns-bootstrap 校验器，均写入 `.bashrc` 常驻。**打开新终端即生效** |
 | 证书缺失 | curl 正常但 codex 失败 | 本脚本已设置 `SSL_CERT_FILE` |
 
-有 root 时走 dns53 原生方案（需要手机已 root/Magisk 且 Termux 的 `sudo` 可用，脚本自动 `pkg install sudo`）；没有 root 时脚本自动改用 dns-bootstrap + proot 兜底（自动 `pkg install proot`），无需 root 也能正常解析。dns53 会自动探测并优先使用手机当前下发的 DNS（运营商 DNS），公共 DNS 兜底。dns-bootstrap 每次启动前实测公网候选 DNS 应答质量（SERVFAIL/空应答/CNAME-only 判废），只把可用的写进 `resolv.conf`，常驻进程每 60 秒重测重写，切 WiFi/基站自动跟随；若当前网络禁止直连公网 DNS 53 端口，它会明确报错而不是静默卡 5 秒。
+有 root 时走 dns53 原生方案（需要手机已 root/Magisk 且 Termux 的 `sudo` 可用，脚本自动 `pkg install sudo`）；没有 root 时脚本自动改用 dns-bootstrap + proot 兜底（自动 `pkg install proot`），无需 root 也能正常解析。dns53 会自动探测并优先使用手机当前下发的 DNS（运营商 DNS），IPv4/IPv6 缺失时分别用公共 DNS 兜底；AAAA 默认不屏蔽（境内 IPv6 可用），境外 IPv6 卡死时可设 `DNS53_DISABLE_AAAA=1` 强制走 IPv4。dns-bootstrap 每次启动前实测公网候选 DNS 应答质量（SERVFAIL/空应答/CNAME-only 判废），只把可用的写进 `resolv.conf`，常驻进程每 60 秒重测重写，切 WiFi/基站自动跟随；若当前网络禁止直连公网 DNS 53 端口，它会明确报错而不是静默卡 5 秒。
 
 **API 时好时坏 / 切换网络后连不上？** 先跑 `bash ~/.check_dns.sh` 三秒定位：
 
