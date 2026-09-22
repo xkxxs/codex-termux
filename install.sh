@@ -851,10 +851,60 @@ CHECK_EOF
     ok "诊断工具已安装: ~/.check_dns.sh (用法: bash ~/.check_dns.sh)"
 }
 
+# ---------- SELinux context 自愈 ----------
+# Android SELinux MLS: 若 codex 相关文件 context 缺少当前进程的 MCS 类别
+# (常见于曾被 root/magisk 创建的文件, 只有 s0 无类别), untrusted_app 将无法
+# rename/readlink → npm install 报 EACCES。有 root 时对齐文件的 MLS 级别自愈。
+# 注意: 进程 context 是 domain (u:r:...), 文件必须是 type (u:object_r:...),
+#       只能取进程的 :sN... 类别段拼到文件已有 type 上。
+fix_selinux_context() {
+    local ctx mcs
+    ctx=$(tr -d '\0' < /proc/self/attr/current 2>/dev/null || true)
+    [ -n "$ctx" ] || return 0
+    mcs=$(printf '%s' "$ctx" | sed -n 's/.*\(:s[0-9][0-9]*.*\)$/\1/p')
+    [ -n "$mcs" ] || return 0
+    command -v sudo >/dev/null 2>&1 || return 0
+    sudo -n true 2>/dev/null || return 0
+
+    local fixed=0 p fctx target
+    for p in "$PREFIX/bin/codex" "$CODEX_PKG_DIR"; do
+        # 坏 context 的 symlink 无法被 unprivileged -e 探测, 先查 -L
+        if [ ! -L "$p" ] && [ ! -e "$p" ]; then
+            sudo -n test -e "$p" 2>/dev/null || continue
+        fi
+        fctx=$(sudo -n stat -c '%C' "$p" 2>/dev/null || true)
+        [ -n "$fctx" ] || continue
+        target="${fctx%%:s*}${mcs}"
+        [ "$fctx" != "$target" ] || continue
+        if [ -L "$p" ]; then
+            sudo -n chcon -h "$target" "$p" 2>/dev/null && fixed=1
+        else
+            sudo -n chcon -R "$target" "$p" 2>/dev/null && fixed=1
+        fi
+    done
+    if [ "$fixed" = 1 ]; then
+        ok "已修复 SELinux context (MCS 类别对齐)"
+    fi
+    return 0
+}
+
 # ---------- 安装官方 Codex ----------
 install_codex() {
     info "安装官方 @openai/codex (npm)…"
-    npm install -g @openai/codex@latest >/dev/null 2>&1 || fail "npm 安装失败"
+    fix_selinux_context
+
+    local npm_out rc=0
+    npm_out=$(npm install -g @openai/codex@latest 2>&1) || rc=$?
+    if [ "$rc" -ne 0 ] && printf '%s' "$npm_out" | grep -q 'EACCES'; then
+        warn "npm 报 EACCES, 尝试修复 SELinux context 后重试…"
+        fix_selinux_context
+        rc=0
+        npm_out=$(npm install -g @openai/codex@latest 2>&1) || rc=$?
+    fi
+    if [ "$rc" -ne 0 ]; then
+        printf '%s\n' "$npm_out" >&2
+        fail "npm 安装失败 (错误见上)"
+    fi
 
     local version
     version=$(npm view @openai/codex version) || fail "无法获取版本号"
@@ -920,11 +970,52 @@ pin_version() {
 EOF
 }
 
+# SELinux context 自愈: 缺 MCS 类别时 untrusted_app 无法 rename → npm EACCES
+# 进程是 domain (u:r:...), 文件须用 type (u:object_r:...) + 进程的 :sN 类别
+fix_selinux_context() {
+    local ctx mcs
+    ctx=$(tr -d '\0' < /proc/self/attr/current 2>/dev/null || true)
+    [ -n "$ctx" ] || return 0
+    mcs=$(printf '%s' "$ctx" | sed -n 's/.*\(:s[0-9][0-9]*.*\)$/\1/p')
+    [ -n "$mcs" ] || return 0
+    command -v sudo >/dev/null 2>&1 || return 0
+    sudo -n true 2>/dev/null || return 0
+    local fixed=0 p fctx target
+    for p in /data/data/com.termux/files/usr/bin/codex "$PKG_DIR"; do
+        if [ ! -L "$p" ] && [ ! -e "$p" ]; then
+            sudo -n test -e "$p" 2>/dev/null || continue
+        fi
+        fctx=$(sudo -n stat -c '%C' "$p" 2>/dev/null || true)
+        [ -n "$fctx" ] || continue
+        target="${fctx%%:s*}${mcs}"
+        [ "$fctx" != "$target" ] || continue
+        if [ -L "$p" ]; then
+            sudo -n chcon -h "$target" "$p" 2>/dev/null && fixed=1
+        else
+            sudo -n chcon -R "$target" "$p" 2>/dev/null && fixed=1
+        fi
+    done
+    [ "$fixed" = 1 ] && echo "→ 已修复 SELinux context (MCS 类别对齐)"
+    return 0
+}
+
 # 完整更新: npm 主包 → 下载对应 linux-arm64 平台二进制 → 解压 vendor。
 # 失败返回 1, 不影响旧二进制继续使用。
 do_update() {
     echo "→ 更新 @openai/codex (npm 主包)…"
-    npm install -g @openai/codex@latest >/dev/null 2>&1 || return 1
+    fix_selinux_context
+    local out rc=0
+    out=$(npm install -g @openai/codex@latest 2>&1) || rc=$?
+    if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'EACCES'; then
+        echo "→ npm 报 EACCES, 尝试修复 SELinux context 后重试…"
+        fix_selinux_context
+        rc=0
+        out=$(npm install -g @openai/codex@latest 2>&1) || rc=$?
+    fi
+    if [ "$rc" -ne 0 ]; then
+        printf '%s\n' "$out" >&2
+        return 1
+    fi
     local ver
     ver="$(npm view @openai/codex version --fetch-timeout=10000 --fetch-retries=0 2>/dev/null)" || return 1
     echo "→ 下载 linux-arm64 平台二进制 v${ver} (绕过 npm os 限制)…"
