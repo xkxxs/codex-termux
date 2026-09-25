@@ -148,14 +148,16 @@ Error: app server did not become ready on
 排查结论：与 musl / patchelf 无关——守护进程的两个二进制都是静态 ELF，单独执行都正常
 （`codex --version`、`codex-code-mode-host` 均能跑），是它在 Android 上初始化时拿不到某个路径（`os error 2`）。
 
-规避方式二选一：
+两个规避手段，**本脚本两个都用**，因为单独一个都不够：
 
-| 方式 | 说明 |
-|---|---|
-| **配置（本脚本采用）** | `~/.codex/config.toml` 加 `daemon_auto_start = false`。脚本安装时幂等写入，wrapper 每次启动自愈一次；你自己显式设过就不会被改 |
-| 命令行 | 每条命令加 `--no-daemon`，如 `codex --no-daemon`（官方报错信息里也这么说） |
+| 手段 | 作用范围 | 说明 |
+|---|---|---|
+| 配置 `daemon_auto_start = false` | `codex exec` 等非交互路径够用 | 脚本安装时幂等写入 `~/.codex/config.toml`，wrapper 每次启动自愈一次；你自己显式设过就不会被改 |
+| wrapper 自动补 `--no-daemon` | **交互式 TUI 必需** | 交互式（`codex`、`codex "提示词"`、`codex resume`）会**显式**要求 daemon，配置里的 `daemon_auto_start=false` 只挡得住"自动拉起"，挡不住这个显式要求——所以必须补 flag。wrapper 仅在版本 ≥0.157 且不是 `app-server` 子命令、且你没自己传过时自动补 |
 
-daemon 只服务于 `codex agents` / `remote-control` 这类实验功能，日常 `codex`、`codex exec` 不需要它。
+想手动验证：`codex --no-daemon`（官方报错信息里也是这么建议的）。
+
+daemon 只服务于 `codex agents` / `remote-control` 这类实验功能，日常 `codex` / `codex exec` 不需要它。
 
 ## 卸载
 

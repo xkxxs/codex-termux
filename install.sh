@@ -1089,6 +1089,16 @@ case "${1:-}" in
         fi
         pin_version
         ensure_no_daemon
+        # 交互式 TUI (codex / codex "提示词" / codex resume ...) 会显式要求 app-server daemon,
+        # 配置里的 daemon_auto_start=false 只挡得住"自动拉起", 挡不住这个显式要求 → 必须补 --no-daemon。
+        # 仅对 ≥0.157 生效 (老版本没有这个 flag, 传了会报 unexpected argument)。
+        # 唯一例外是 app-server 子命令本身 (它就是拿来管 daemon 的)。
+        cur_v="${CURRENT:-$(current_version)}"
+        if [ -n "$cur_v" ] && [ "$(printf '%s\n%s\n' "$cur_v" "0.157.0" | sort -V | tail -n1)" = "$cur_v" ] \
+           && [ "${1:-}" != "app-server" ] \
+           && ! printf '%s\n' "$@" | grep -qx -- '--no-daemon'; then
+            set -- --no-daemon "$@"
+        fi
         RESOLV_CONF="${PREFIX:-/data/data/com.termux/files/usr}/etc/resolv.conf"
         # 有 root: 确保本地 DNS 转发器在跑 (见 README "DNS 修复")
         # 无 root: dns-bootstrap 实测校验后 proot 绑定 resolv.conf
