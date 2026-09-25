@@ -922,6 +922,29 @@ install_codex() {
     ok "Codex $version 二进制已安装"
 }
 
+# ---------- 关闭 app-server daemon ----------
+# Codex ≥0.157 新增实验性 app-server daemon: 启动时 fork 守护进程并连它的 unix socket,
+# 而该守护进程在 Android 上启动即退出 ("Error: No such file or directory (os error 2)",
+# 与 musl/patchelf 无关 —— 它的两个二进制都是静态的且单独跑都正常), 于是 CLI 卡在
+#   "app server did not become ready on ~/.codex/app-server-control/app-server-control.sock"
+# 官方给了两个规避: 每条命令加 --no-daemon, 或配置 daemon_auto_start = false (0.157 起被识别)。
+# 这里写配置一劳永逸; 用户显式设过则不动 (幂等)。
+disable_app_server_daemon() {
+    local cfg="$HOME_DIR/.codex/config.toml"
+    mkdir -p "$HOME_DIR/.codex" 2>/dev/null || { warn "无法创建 ~/.codex, 跳过 daemon 设置"; return 0; }
+    if [ ! -f "$cfg" ]; then
+        printf 'daemon_auto_start = false\n' > "$cfg"
+        ok "已写入 $cfg (关闭 app-server daemon 自动启动)"
+        return 0
+    fi
+    if grep -qE '^[[:space:]]*daemon_auto_start' "$cfg" 2>/dev/null; then
+        ok "app-server daemon 设置已存在, 未改动"
+        return 0
+    fi
+    printf '\ndaemon_auto_start = false\n' >> "$cfg"
+    ok "已追加 daemon_auto_start = false 到 ~/.codex/config.toml"
+}
+
 # ---------- 启动 wrapper ----------
 write_wrapper() {
     mkdir -p "$HOME_DIR/.local/bin"
@@ -959,6 +982,19 @@ latest_version() {
 # 版本比较: $1 >= $2 返回 0 (sort -V 语义)
 version_ge() {
     [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" = "$1" ]
+}
+
+# Codex ≥0.157 的 app-server daemon 在 Android 上起不来 → 关掉自动启动。
+# 幂等: 用户自己显式设过 daemon_auto_start 就不动。
+ensure_no_daemon() {
+    local cfg="$HOME/.codex/config.toml"
+    mkdir -p "$HOME/.codex" 2>/dev/null || return 0
+    if [ ! -f "$cfg" ]; then
+        printf 'daemon_auto_start = false\n' > "$cfg"
+        return 0
+    fi
+    grep -qE '^[[:space:]]*daemon_auto_start' "$cfg" 2>/dev/null \
+        || printf '\ndaemon_auto_start = false\n' >> "$cfg"
 }
 
 # 固定 version.json 为当前实际版本, 避免假升级循环
@@ -1052,6 +1088,7 @@ case "${1:-}" in
             fi
         fi
         pin_version
+        ensure_no_daemon
         RESOLV_CONF="${PREFIX:-/data/data/com.termux/files/usr}/etc/resolv.conf"
         # 有 root: 确保本地 DNS 转发器在跑 (见 README "DNS 修复")
         # 无 root: dns-bootstrap 实测校验后 proot 绑定 resolv.conf
@@ -1145,6 +1182,7 @@ upgrade_packages
 install_dependencies
 fix_cert
 install_codex
+disable_app_server_daemon
 write_wrapper
 fix_dns
 verify

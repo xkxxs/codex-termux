@@ -135,6 +135,28 @@ bash <(curl -fsSL https://cdn.deepseek.com/api-docs/codex-deepseek-setup.sh)
 - OpenAI 官方 JS 入口（`codex.js`）已显式支持 `android` 平台映射到 linux-musl
 - 唯一障碍是 npm 包元数据 `os: linux`，脚本用 `npm pack` + `tar xzf` 绕过
 
+## app-server daemon（Codex ≥ 0.157 必看）
+
+Codex 0.157 起新增**实验性 app-server daemon**：CLI 启动时会 fork 一个守护进程并连它的 unix socket。
+该守护进程**在 Android 上启动即退出**，于是 CLI 卡在：
+
+```
+Error: app server did not become ready on
+/data/data/com.termux/files/home/.codex/app-server-control/app-server-control.sock
+```
+
+排查结论：与 musl / patchelf 无关——守护进程的两个二进制都是静态 ELF，单独执行都正常
+（`codex --version`、`codex-code-mode-host` 均能跑），是它在 Android 上初始化时拿不到某个路径（`os error 2`）。
+
+规避方式二选一：
+
+| 方式 | 说明 |
+|---|---|
+| **配置（本脚本采用）** | `~/.codex/config.toml` 加 `daemon_auto_start = false`。脚本安装时幂等写入，wrapper 每次启动自愈一次；你自己显式设过就不会被改 |
+| 命令行 | 每条命令加 `--no-daemon`，如 `codex --no-daemon`（官方报错信息里也这么说） |
+
+daemon 只服务于 `codex agents` / `remote-control` 这类实验功能，日常 `codex`、`codex exec` 不需要它。
+
 ## 卸载
 
 ```bash
@@ -150,6 +172,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/xkxxs/codex-termux/main/inst
 | `unknown variant 'max'` | models.json 用了新版档位，Codex ≤0.121 | 把 `max` 改成 `xhigh`，或升级 Codex |
 | 启动提示升级且无限循环 | `version.json` 的版本号与本地二进制不一致 | wrapper 已自动固定且**启动前自动更新**，不会出现假升级；不要用社区适配包 |
 | 没有 root | 无法绑定 53 端口，dns53 方案不可用 | 脚本自动改用 dns-bootstrap 实测校验 + proot 兜底（自动 `pkg install proot`），无需 root；网络禁止公网 53 时给出明确报错 |
+| `app server did not become ready on …/app-server-control.sock` | Codex ≥0.157 的 app-server daemon 在 Android 上起不来 | 脚本已自动写入 `daemon_auto_start = false`；临时方案是每条命令加 `--no-daemon`。详见[上一节](#app-server-daemoncodex--0157-必看) |
 
 ## 许可证
 
