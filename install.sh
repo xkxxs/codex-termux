@@ -4,9 +4,9 @@
 # 前置要求: 有 root → dns53 原生方案; 无 root → proot 兜底 (无需 root, 自动检测)
 #
 # 用法:
-#   bash <(curl -fsSL https://raw.githubusercontent.com/<USER>/codex-termux/main/install.sh)
-#   bash <(curl -fsSL https://raw.githubusercontent.com/<USER>/codex-termux/main/install.sh) --update
-#   bash <(curl -fsSL https://raw.githubusercontent.com/<USER>/codex-termux/main/install.sh) --uninstall
+#   bash <(curl -fsSL https://raw.githubusercontent.com/xkxxs/codex-termux/main/install.sh)
+#   bash <(curl -fsSL https://raw.githubusercontent.com/xkxxs/codex-termux/main/install.sh) --update
+#   bash <(curl -fsSL https://raw.githubusercontent.com/xkxxs/codex-termux/main/install.sh) --uninstall
 #
 # 原理:
 #   官方 @openai/codex 的 linux-arm64 平台包是 musl 静态链接,
