@@ -44,6 +44,16 @@
 bash <(curl -fsSL https://raw.githubusercontent.com/xkxxs/codex-termux/main/install.sh)
 ```
 
+国内网络拉不动 `raw.githubusercontent.com` 时,改用镜像:
+
+```bash
+# jsDelivr CDN
+bash <(curl -fsSL https://cdn.jsdelivr.net/gh/xkxxs/codex-termux@main/install.sh)
+
+# 或 gh-proxy
+bash <(curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/xkxxs/codex-termux/main/install.sh)
+```
+
 > 有 root / 无 root 都能装：有 root 走 dns53 原生直跑，无 root 自动用 proot 兜底（见[前置要求](#前置要求)）。
 
 ## 脚本做了什么
