@@ -145,8 +145,33 @@ Error: app server did not become ready on
 /data/data/com.termux/files/home/.codex/app-server-control/app-server-control.sock
 ```
 
-排查结论：与 musl / patchelf 无关——守护进程的两个二进制都是静态 ELF，单独执行都正常
-（`codex --version`、`codex-code-mode-host` 均能跑），是它在 Android 上初始化时拿不到某个路径（`os error 2`）。
+### 根因：daemon 启动时的 bwrap 沙箱探测必失败
+
+用 `strace -f` 全量追踪 `codex app-server daemon start`，完整链路：
+
+1. daemon 启动会 exec 一次沙箱能力探测：
+   `bwrap --unshare-user --unshare-net --ro-bind / / /bin/true`
+2. **bwrap 在 Android 上不可用**（无论什么身份）：
+
+   | 身份 | 报错 |
+   |---|---|
+   | app 用户 | `Can't read /proc/sys/kernel/overflowuid: Permission denied`（SELinux/权限；root 能读到 65534） |
+   | root | `Failed to mount tmpfs: No such file or directory`（Android 没有 `/tmp`） |
+   | root + `--unshare-user` | `Creating new namespace failed, likely because the kernel does not support user namespaces` |
+
+3. 探测失败 → daemon 进程 abort，打印 `Error: No such file or directory (os error 2)` 后 `exit 1`
+4. 因此它**全程没有一次 `bind()` / `listen()`**（strace 可证），socket 文件根本没被创建
+5. CLI 连不上 socket → `app server did not become ready`
+
+与 musl / patchelf 无关：daemon 的两个二进制都是静态 ELF，单独执行都正常。
+顺带排除两个误导项：
+
+- `ps -p <pid> -o stat= -o lstart=` 在 Android 上返回**假的 2022 年日期**（procps 算不出正确启动时间），
+  那只是 daemon 的身份校验，不是致命点（`daemon.pid` 里的 2022 时间戳就是这么来的）
+- `CODEX_SANDBOX=none|off|disabled|false` 均无效（它是内部标记，不是输入开关）
+
+**所以 `--no-daemon` 是这台设备上的唯一解，不是临时补丁**：bwrap 依赖的 kernel user namespace
+与 `/tmp` 在 Android 上都不存在，装任何包都补不回来。
 
 两个规避手段，**本脚本两个都用**，因为单独一个都不够：
 
