@@ -135,29 +135,37 @@ bash <(curl -fsSL https://cdn.deepseek.com/api-docs/codex-deepseek-setup.sh)
 - OpenAI 官方 JS 入口（`codex.js`）已显式支持 `android` 平台映射到 linux-musl
 - 唯一障碍是 npm 包元数据 `os: linux`，脚本用 `npm pack` + `tar xzf` 绕过
 
-## app-server daemon（Codex ≥ 0.157 必看）
+## app-server daemon（历史问题 + 现状）
 
-Codex 0.157 起新增**实验性 app-server daemon**：CLI 启动时会 fork 一个守护进程并连它的 unix socket。
-该守护进程**在 Android 上启动即退出**，于是 CLI 卡在：
+### 0.157.0：启动即失败（已由上游修复）
+
+Codex 0.157.0 新增**实验性 app-server daemon**：CLI 启动时会 fork 守护进程并连它的 unix socket，
+而该守护进程在 Android 上启动即退出，CLI 卡在：
 
 ```
 Error: app server did not become ready on
 /data/data/com.termux/files/home/.codex/app-server-control/app-server-control.sock
 ```
 
-排查结论：与 musl / patchelf 无关——守护进程的两个二进制都是静态 ELF，单独执行都正常
-（`codex --version`、`codex-code-mode-host` 均能跑），是它在 Android 上初始化时拿不到某个路径（`os error 2`）。
+排查结论：与 musl / patchelf 无关——守护进程的两个二进制都是静态 ELF（无 `INTERP` / `NEEDED`），
+单独执行都正常（`codex --version`、`codex-code-mode-host` 均有输出），是它在 Android 上初始化时
+拿不到某个路径（`os error 2`）。
 
-两个规避手段，**本脚本两个都用**，因为单独一个都不够：
+**0.157.1 起交互式不再硬依赖 daemon，问题消失。** 本脚本不再做任何规避（装的就是最新版）；
+万一你钉在 0.157.0，临时规避是每条命令加 `--no-daemon`，或在 `~/.codex/config.toml` 写
+`daemon_auto_start = false`（0.157 起被识别；注意它只挡得住"自动拉起"，交互式还得靠 `--no-daemon`）。
 
-| 手段 | 作用范围 | 说明 |
-|---|---|---|
-| 配置 `daemon_auto_start = false` | `codex exec` 等非交互路径够用 | 脚本安装时幂等写入 `~/.codex/config.toml`，wrapper 每次启动自愈一次；你自己显式设过就不会被改 |
-| wrapper 自动补 `--no-daemon` | **交互式 TUI 必需** | 交互式（`codex`、`codex "提示词"`、`codex resume`）会**显式**要求 daemon，配置里的 `daemon_auto_start=false` 只挡得住"自动拉起"，挡不住这个显式要求——所以必须补 flag。wrapper 仅在版本 ≥0.157 且不是 `app-server` 子命令、且你没自己传过时自动补 |
+### 现状：daemon 本体在 Android 上仍然起不来
 
-想手动验证：`codex --no-daemon`（官方报错信息里也是这么建议的）。
+`codex` / `codex exec` 正常，但 daemon 本身没修好：
 
-daemon 只服务于 `codex agents` / `remote-control` 这类实验功能，日常 `codex` / `codex exec` 不需要它。
+- daemon 包仍锁在 **0.157.0**（`~/.codex/packages/app-server-daemon/auto-update-version` 与 `current` 软链）
+- 手动 `codex app-server daemon start` 依旧报 `os error 2`，`app-server-control.sock` 建不出来
+- 想更新它也不行：`codex app-server daemon update` 要去拉 `https://chatgpt.com/codex/install.sh`，
+  该域名在国内网络下超时（这也是它一直停在 0.157.0 的原因）
+
+影响范围：只有 `codex agents` / `codex remote-control` 这类依赖 daemon 的实验功能不可用，
+日常交互与 `codex exec` 不受影响。
 
 ## 卸载
 
@@ -174,7 +182,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/xkxxs/codex-termux/main/inst
 | `unknown variant 'max'` | models.json 用了新版档位，Codex ≤0.121 | 把 `max` 改成 `xhigh`，或升级 Codex |
 | 启动提示升级且无限循环 | `version.json` 的版本号与本地二进制不一致 | wrapper 已自动固定且**启动前自动更新**，不会出现假升级；不要用社区适配包 |
 | 没有 root | 无法绑定 53 端口，dns53 方案不可用 | 脚本自动改用 dns-bootstrap 实测校验 + proot 兜底（自动 `pkg install proot`），无需 root；网络禁止公网 53 时给出明确报错 |
-| `app server did not become ready on …/app-server-control.sock` | Codex ≥0.157 的 app-server daemon 在 Android 上起不来 | 脚本已自动写入 `daemon_auto_start = false`；临时方案是每条命令加 `--no-daemon`。详见[上一节](#app-server-daemoncodex--0157-必看) |
+| `app server did not become ready on …/app-server-control.sock` | Codex **0.157.0** 的 app-server daemon 在 Android 上起不来 | 升级到 0.157.1+ 即可（重跑本脚本）；临时规避是加 `--no-daemon`。详见[上一节](#app-server-daemon历史问题--现状) |
 
 ## 许可证
 
