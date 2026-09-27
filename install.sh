@@ -34,6 +34,59 @@ info() { echo -e "${BLU}▸${NC} $*"; }
 warn() { echo -e "${YEL}⚠${NC} $*"; }
 fail() { echo -e "${RED}✗${NC} $*"; exit 1; }
 
+# ---------- 进度显示 ----------
+# 背景: npm install / npm pack 全程无输出, 大包下载会让人以为卡死。
+# ① npm install -g 这类无输出的长步骤 → 转圈 + 已耗时 (输出存 $SPIN_LOG, 失败才打印)
+# ② 平台包下载 → 先用 npm view 拿真实 URL (跟随 registry 配置, 如 npmmirror),
+#    再用 curl --progress-bar 下载 (有进度条/速度/剩余时间); 失败换镜像, 再回退 npm pack。
+SPIN_CHARS='|/-\'
+SPIN_LOG=""
+
+run_with_spinner() {
+    local msg="$1"; shift
+    SPIN_LOG="${TMPDIR:-$PREFIX/tmp}/spin.$$.log"
+    "$@" >"$SPIN_LOG" 2>&1 &
+    local pid=$! i=0 t0=$SECONDS
+    while kill -0 "$pid" 2>/dev/null; do
+        printf '\r\033[K%s %s (%ds)' "$msg" "${SPIN_CHARS:$((i++ % 4)):1}" "$((SECONDS - t0))"
+        sleep 0.5
+    done
+    wait "$pid"; local rc=$?
+    printf '\r\033[K'
+    if [ "$rc" -ne 0 ]; then
+        warn "$msg 失败, 输出如下:"
+        cat "$SPIN_LOG" >&2
+    else
+        echo -e "${msg} ${GRN}完成${NC} (${SECONDS}秒)"
+    fi
+    return $rc
+}
+
+npm_tarball_url() { npm view "$1" dist.tarball 2>/dev/null | tail -1; }
+
+download_npm_tarball() {
+    local spec="$1" out="$2" url="" alt=""
+    url="$(npm_tarball_url "$spec")"
+    if [ -n "$url" ]; then
+        curl -fSL --progress-bar --connect-timeout 15 --max-time 900 "$url" -o "$out" && return 0
+        case "$url" in
+            *registry.npmjs.org*)     alt="${url/registry.npmjs.org/registry.npmmirror.com}" ;;
+            *registry.npmmirror.com*) alt="${url/registry.npmmirror.com/registry.npmjs.org}" ;;
+        esac
+        if [ -n "$alt" ] && [ "$alt" != "$url" ]; then
+            warn "直连失败, 换镜像重试…"
+            curl -fSL --progress-bar --connect-timeout 15 --max-time 900 "$alt" -o "$out" && return 0
+        fi
+    fi
+    info "直连失败, 回退 npm pack (此方式无进度显示)…"
+    (cd "$(dirname "$out")" && npm pack "$spec" --silent >/dev/null 2>&1) || return 1
+    local packed
+    packed="$(ls "$(dirname "$out")"/*.tgz 2>/dev/null | head -1)"
+    [ -n "$packed" ] || return 1
+    [ "$packed" = "$out" ] || mv -f "$packed" "$out"
+    return 0
+}
+
 # ---------- 环境检查 ----------
 check_environment() {
     if [ "$(uname -o 2>/dev/null || true)" != "Android" ] && [ ! -x "$PREFIX/bin/pkg" ]; then
@@ -893,29 +946,31 @@ install_codex() {
     info "安装官方 @openai/codex (npm)…"
     fix_selinux_context
 
-    local npm_out rc=0
-    npm_out=$(npm install -g @openai/codex@latest 2>&1) || rc=$?
-    if [ "$rc" -ne 0 ] && printf '%s' "$npm_out" | grep -q 'EACCES'; then
+    local rc=0
+    run_with_spinner "安装 @openai/codex (npm)…" npm install -g @openai/codex@latest || rc=$?
+    if [ "$rc" -ne 0 ] && grep -q 'EACCES' "$SPIN_LOG" 2>/dev/null; then
         warn "npm 报 EACCES, 尝试修复 SELinux context 后重试…"
         fix_selinux_context
         rc=0
-        npm_out=$(npm install -g @openai/codex@latest 2>&1) || rc=$?
+        run_with_spinner "安装 @openai/codex (npm)…" npm install -g @openai/codex@latest || rc=$?
     fi
     if [ "$rc" -ne 0 ]; then
-        printf '%s\n' "$npm_out" >&2
         fail "npm 安装失败 (错误见上)"
     fi
+    rm -f "$SPIN_LOG"
 
     local version
     version=$(npm view @openai/codex version) || fail "无法获取版本号"
     info "下载 linux-arm64 平台二进制 v$version (绕过 npm os 限制)…"
 
     # npm 会因 os=linux vs android 拒绝安装平台包, 手动解压 tarball
-    local tarball
-    tarball=$(npm pack "@openai/codex@${version}-linux-arm64" --silent) || fail "平台包下载失败"
+    local work tgz
+    work=$(mktemp -d "${TMPDIR:-$PREFIX/tmp}/codex-pkg.XXXXXX")
+    tgz="$work/codex.tgz"
+    download_npm_tarball "@openai/codex@${version}-linux-arm64" "$tgz" || fail "平台包下载失败"
     mkdir -p "$CODEX_PKG_DIR"
-    tar xzf "$tarball" -C "$CODEX_PKG_DIR" --strip-components=1 package/vendor
-    rm -f "$tarball"
+    tar xzf "$tgz" -C "$CODEX_PKG_DIR" --strip-components=1 package/vendor
+    rm -rf "$work"
 
     [ -x "$VENDOR_BIN" ] || fail "二进制未就位: $VENDOR_BIN"
     chmod +x "$VENDOR_BIN"
@@ -972,6 +1027,57 @@ VERSION_FILE="$HOME/.codex/version.json"
 # 本地实际版本 (如 0.147.0); 失败时为空
 current_version() {
     node "$REAL_JS" --version 2>/dev/null | sed 's/.*cli //'
+}
+
+# ---------- 下载进度 ----------
+# npm pack 无进度显示: 先用 npm view 拿真实 URL (跟随 registry 配置),
+# 再用 curl --progress-bar 下载; 失败换镜像, 再回退 npm pack。
+SPIN_CHARS='|/-\'
+SPIN_LOG=""
+
+run_with_spinner() {
+    local msg="$1"; shift
+    SPIN_LOG="${TMPDIR:-/data/data/com.termux/files/usr/tmp}/spin.$$.log"
+    "$@" >"$SPIN_LOG" 2>&1 &
+    local pid=$! i=0 t0=$SECONDS
+    while kill -0 "$pid" 2>/dev/null; do
+        printf '\r\033[K%s %s (%ds)' "$msg" "${SPIN_CHARS:$((i++ % 4)):1}" "$((SECONDS - t0))"
+        sleep 0.5
+    done
+    wait "$pid"; local rc=$?
+    printf '\r\033[K'
+    if [ "$rc" -ne 0 ]; then
+        echo "!! $msg 失败, 输出如下:" >&2
+        cat "$SPIN_LOG" >&2
+    else
+        echo "$msg 完成 ($((SECONDS - t0))秒)"
+    fi
+    return $rc
+}
+
+npm_tarball_url() { npm view "$1" dist.tarball 2>/dev/null | tail -1; }
+
+download_npm_tarball() {
+    local spec="$1" out="$2" url="" alt=""
+    url="$(npm_tarball_url "$spec")"
+    if [ -n "$url" ]; then
+        curl -fSL --progress-bar --connect-timeout 15 --max-time 900 "$url" -o "$out" && return 0
+        case "$url" in
+            *registry.npmjs.org*)     alt="${url/registry.npmjs.org/registry.npmmirror.com}" ;;
+            *registry.npmmirror.com*) alt="${url/registry.npmmirror.com/registry.npmjs.org}" ;;
+        esac
+        if [ -n "$alt" ] && [ "$alt" != "$url" ]; then
+            echo "!! 直连失败, 换镜像重试…" >&2
+            curl -fSL --progress-bar --connect-timeout 15 --max-time 900 "$alt" -o "$out" && return 0
+        fi
+    fi
+    echo "→ 直连失败, 回退 npm pack (无进度显示)…" >&2
+    (cd "$(dirname "$out")" && npm pack "$spec" --silent >/dev/null 2>&1) || return 1
+    local packed
+    packed="$(ls "$(dirname "$out")"/*.tgz 2>/dev/null | head -1)"
+    [ -n "$packed" ] || return 1
+    [ "$packed" = "$out" ] || mv -f "$packed" "$out"
+    return 0
 }
 
 # npm 源上的最新版本; 失败时为空 (快速失败, 不拖慢启动)
@@ -1040,26 +1146,28 @@ fix_selinux_context() {
 do_update() {
     echo "→ 更新 @openai/codex (npm 主包)…"
     fix_selinux_context
-    local out rc=0
-    out=$(npm install -g @openai/codex@latest 2>&1) || rc=$?
-    if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'EACCES'; then
+    local rc=0
+    run_with_spinner "更新 @openai/codex (npm)…" npm install -g @openai/codex@latest || rc=$?
+    if [ "$rc" -ne 0 ] && grep -q 'EACCES' "$SPIN_LOG" 2>/dev/null; then
         echo "→ npm 报 EACCES, 尝试修复 SELinux context 后重试…"
         fix_selinux_context
         rc=0
-        out=$(npm install -g @openai/codex@latest 2>&1) || rc=$?
+        run_with_spinner "更新 @openai/codex (npm)…" npm install -g @openai/codex@latest || rc=$?
     fi
     if [ "$rc" -ne 0 ]; then
-        printf '%s\n' "$out" >&2
         return 1
     fi
+    rm -f "$SPIN_LOG"
     local ver
     ver="$(npm view @openai/codex version --fetch-timeout=10000 --fetch-retries=0 2>/dev/null)" || return 1
     echo "→ 下载 linux-arm64 平台二进制 v${ver} (绕过 npm os 限制)…"
-    local tarball
-    tarball="$(npm pack "@openai/codex@${ver}-linux-arm64" --silent)" || return 1
+    local work tgz
+    work=$(mktemp -d "${TMPDIR:-$PREFIX/tmp}/codex-update.XXXXXX") || return 1
+    tgz="$work/codex.tgz"
+    download_npm_tarball "@openai/codex@${ver}-linux-arm64" "$tgz" || { rm -rf "$work"; return 1; }
     rm -rf "$PKG_DIR/vendor"
-    tar xzf "$tarball" -C "$PKG_DIR" --strip-components=1 package/vendor
-    rm -f "$tarball"
+    tar xzf "$tgz" -C "$PKG_DIR" --strip-components=1 package/vendor
+    rm -rf "$work"
     [ -x "$VENDOR_BIN" ] || return 1
     chmod +x "$VENDOR_BIN"
     pin_version
