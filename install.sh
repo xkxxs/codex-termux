@@ -125,68 +125,79 @@ install_dependencies() {
 }
 
 # ---------- 镜像源适配 ----------
-# 刚装的 Termux 默认官方源, 国内经常慢/不可达。对官方 + 国内主流镜像
-# 逐个测速 (取 2 次最快), 自动切换到最快者 (幂等)。
+# 刚装的 Termux 默认官方源, 国内经常慢/不可达。对候选源逐个"探测 + 测速",
+# 自动切换到最快的可用源 (幂等; 切换后 apt update 失败会自动回滚)。
+#
+# 踩过的两个坑 (都实际造成过故障):
+#   1) 各家镜像的路径不一样: 有的是 /termux/apt/termux-main, 有的是
+#      /termux/termux-main —— 不能假定同一个模式, 否则会拿到 404。
+#   2) 测速必须同时校验 HTTP 状态码: 只看 %{time_total} 的话, 404 的响应也
+#      很快, 会被误判成"最快"并切过去, 结果 apt update 直接失败。
 fix_mirror() {
     local sources_file="$PREFIX/etc/apt/sources.list"
     [ -f "$sources_file" ] || { warn "未找到 apt 源文件, 跳过镜像适配"; return; }
 
-    # 候选源: (显示名 URL前缀)
+    # 候选: "显示名 base URL" (路径各不相同, 已逐个实测 HTTP 200)
     local candidates=(
-        "packages.termux.dev"
-        "mirrors.aliyun.com/termux"
-        "mirrors.tuna.tsinghua.edu.cn/termux"
-        "mirrors.ustc.edu.cn/termux"
-        "mirrors.cloud.tencent.com/termux"
-        "mirrors.huaweicloud.com/termux"
+        "官方 https://packages.termux.dev/apt/termux-main"
+        "阿里云 https://mirrors.aliyun.com/termux/termux-main"
+        "清华 https://mirrors.tuna.tsinghua.edu.cn/termux/apt/termux-main"
+        "中科大 https://mirrors.ustc.edu.cn/termux/apt/termux-main"
+        "北大 https://mirrors.pku.edu.cn/termux/termux-main"
+        "华为云 https://mirrors.huaweicloud.com/termux/termux-main"
     )
 
-    # 逐源测速 (2 次取最快, 全部失败得 99)
-    local best="" best_t=99 c t1 t2 t
-    for c in "${candidates[@]}"; do
-        t1=$(curl -s -o /dev/null -w '%{time_total}' --connect-timeout 3 --max-time 8 \
-            "https://$c/apt/termux-main/dists/stable/Release" 2>/dev/null || echo 99)
-        t2=$(curl -s -o /dev/null -w '%{time_total}' --connect-timeout 3 --max-time 8 \
-            "https://$c/apt/termux-main/dists/stable/Release" 2>/dev/null || echo 99)
-        t=$(printf '%s\n%s\n' "$t1" "$t2" | sort -n | head -1)
-        info "测速 $c: ${t}s"
+    local entry name url r1 code t1 t2 t
+    local best_name="" best_url="" best_t=999999
+    for entry in "${candidates[@]}"; do
+        name="${entry%% *}"
+        url="${entry##* }"
+        r1="$(curl -s -o /dev/null -w '%{http_code} %{time_total}' \
+            --connect-timeout 4 --max-time 10 "$url/dists/stable/Release" 2>/dev/null || echo '000 999')"
+        code="${r1%% *}"; t1="${r1##* }"
+        if [ "$code" != "200" ]; then
+            info "跳过 $name (Release 不可用: HTTP $code)"
+            continue
+        fi
+        # 再测一次取较快值
+        t2="$(curl -s -o /dev/null -w '%{time_total}' \
+            --connect-timeout 4 --max-time 10 "$url/dists/stable/Release" 2>/dev/null || echo 999)"
+        t="$(printf '%s\n%s\n' "$t1" "$t2" | sort -n | head -1)"
+        info "测速 $name: ${t}s"
         if awk "BEGIN{exit !($t < $best_t)}"; then
-            best="$c"; best_t="$t"
+            best_name="$name"; best_url="$url"; best_t="$t"
         fi
     done
 
-    if [ -z "$best" ]; then
-        warn "全部源测速失败, 保持当前配置 (可手动: pkg change-repo)"
+    if [ -z "$best_url" ]; then
+        warn "所有候选源都不可用, 保持当前配置 (可手动: pkg change-repo)"
         return
     fi
-    ok "最快源: $best (${best_t}s)"
+    ok "最快可用源: $best_name (${best_t}s)"
 
     # 当前已是最快 → 不动
-    if grep -q "$best" "$sources_file" 2>/dev/null; then
+    if grep -qF "$best_url" "$sources_file" 2>/dev/null; then
         ok "当前源已是最快, 无需切换"
         return
     fi
 
-    warn "切换源: $(grep -oE 'https://[^/]+' "$sources_file" | head -1) → $best"
-    cp "$sources_file" "$sources_file.bak.$(date +%s)"
+    local backup="$sources_file.bak.$(date +%s)"
+    cp "$sources_file" "$backup"
+    warn "切换源: $(grep -oE 'https://[^ ]+' "$sources_file" | head -1) → $best_name"
     {
-        echo "# The termux-main repository contains the primary packages."
-        echo "deb https://$best/apt/termux-main stable main"
+        echo "# 由 install.sh 自动切换 (最快源: $best_name ${best_t}s)"
+        echo "deb $best_url stable main"
     } > "$sources_file"
-    info "已切换 (原配置已备份: sources.list.bak.*)"
 
     if DEBIAN_FRONTEND=noninteractive apt update -y; then
-        ok "apt update 成功 ($best)"
+        ok "apt update 成功 ($best_name), 原配置备份: $(basename "$backup")"
     else
-        warn "apt update 失败, 请手动检查: pkg change-repo"
+        warn "apt update 失败, 已自动回滚到原配置"
+        cp "$backup" "$sources_file"
+        DEBIAN_FRONTEND=noninteractive apt update -y || true
     fi
 }
 
-# ---------- 全量升级 ----------
-# 换好源后把所有软件包升到最新 (幂等: 已最新则跳过)
-# ⚠️ 不要重定向输出到 /dev/null: 全新 Termux 首次升级要下载几百 MB,
-#    无输出会看起来像"卡死" (实际在下载), 用户会误以为卡住而 Ctrl+C。
-#    DEBIAN_FRONTEND=noninteractive 避免 dpkg conffile 提问在管道里静默卡住。
 upgrade_packages() {
     info "更新软件包索引并升级全部软件包…"
     info "提示: 全新 Termux 首次升级可能耗时数分钟 (下载量大), 请耐心等待, 不要打断"
