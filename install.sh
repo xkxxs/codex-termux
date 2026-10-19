@@ -125,14 +125,33 @@ install_dependencies() {
 }
 
 # ---------- 镜像源适配 ----------
-# 刚装的 Termux 默认官方源, 国内经常慢/不可达。对候选源逐个"探测 + 测速",
-# 自动切换到最快的可用源 (幂等; 切换后 apt update 失败会自动回滚)。
+# 刚装的 Termux 默认官方源, 国内经常慢/不可达。本函数对候选源逐个探测 + 测速,
+# 再按"新鲜度优先、速度兜底"选一个自动切换 (幂等; 切换后 apt update 失败会回滚)。
 #
-# 踩过的两个坑 (都实际造成过故障):
-#   1) 各家镜像的路径不一样: 有的是 /termux/apt/termux-main, 有的是
-#      /termux/termux-main —— 不能假定同一个模式, 否则会拿到 404。
-#   2) 测速必须同时校验 HTTP 状态码: 只看 %{time_total} 的话, 404 的响应也
-#      很快, 会被误判成"最快"并切过去, 结果 apt update 直接失败。
+# 排序规则 —— 每一条都是实测踩出来的:
+#   1) 可用性: HTTP 200 **且 Release 里能解析出 Date: 字段**
+#      华为云是反例: /termux/... 路径下 Release 与 Packages 都返回 200, 内容却是
+#      一个 12KB 的 HTML 页面。只校验状态码的话它会被算进候选。
+#   2) 绝对陈旧: Release 日期距今超过 MIRROR_MAX_AGE 的直接判废。
+#      腾讯云实测停留在 4 个月前 (2831 包 vs 官方 3009 包, python 3.13 vs 3.14)。
+#   3) 新鲜度优先: Release 日期落后"最新的那个候选"超过 MIRROR_FRESH_GRACE 就不要。
+#      实测 2026-10-19 —— 快慢和新鲜度并不一致:
+#        官方/清华      python 3.14.8   nodejs 26.4.0-1   patchelf 0.19.2
+#        中科大/阿里云  python 3.14.6-1 (其余同上)
+#        腾讯云         python 3.13.13  nodejs 26.3.1    patchelf 0.19.0
+#      只看速度很容易切到一个包版本偏旧的源。
+#   4) 落在宽限窗口内的多个候选 → 选最快的。
+MIRROR_FRESH_GRACE="${MIRROR_FRESH_GRACE:-43200}"   # 12 小时
+MIRROR_MAX_AGE="${MIRROR_MAX_AGE:-2592000}"         # 30 天
+
+# $1=Release 文件路径 → 输出 Unix 时间戳; 解析不出返回非零
+release_ts() {
+    local d
+    d=$(awk -F': ' '/^Date: /{print $2; exit}' "$1" 2>/dev/null) || d=""
+    [ -n "$d" ] || return 1
+    date -d "$d" +%s 2>/dev/null || return 1
+}
+
 fix_mirror() {
     local sources_file="$PREFIX/etc/apt/sources.list"
     [ -f "$sources_file" ] || { warn "未找到 apt 源文件, 跳过镜像适配"; return; }
@@ -140,44 +159,80 @@ fix_mirror() {
     # 候选: "显示名 base URL" (路径各不相同, 已逐个实测 HTTP 200)
     local candidates=(
         "官方 https://packages.termux.dev/apt/termux-main"
-        "阿里云 https://mirrors.aliyun.com/termux/termux-main"
         "清华 https://mirrors.tuna.tsinghua.edu.cn/termux/apt/termux-main"
         "中科大 https://mirrors.ustc.edu.cn/termux/apt/termux-main"
+        "阿里云 https://mirrors.aliyun.com/termux/termux-main"
         "北大 https://mirrors.pku.edu.cn/termux/termux-main"
-        "华为云 https://mirrors.huaweicloud.com/termux/termux-main"
+        "南科大 https://mirrors.sustech.edu.cn/termux/apt/termux-main"
     )
 
-    local entry name url r1 code t1 t2 t
-    local best_name="" best_url="" best_t=999999
+    local work entry name url code ts age t1 t2 t i cut
+    work=$(mktemp -d "${TMPDIR:-$PREFIX/tmp}/mirror.XXXXXX")
+    # shellcheck disable=SC2064
+    trap "rm -rf '$work'" RETURN
+
+    local now n=0 newest=0
+    local -a NAMES=() URLS=() TIMES=() STAMPS=()
+    now=$(date +%s)
+
     for entry in "${candidates[@]}"; do
         name="${entry%% *}"
         url="${entry##* }"
-        r1="$(curl -s -o /dev/null -w '%{http_code} %{time_total}' \
-            --connect-timeout 4 --max-time 10 "$url/dists/stable/Release" 2>/dev/null || echo '000 999')"
-        code="${r1%% *}"; t1="${r1##* }"
+        code=$(curl -s -o "$work/rel" -w '%{http_code}' \
+            --connect-timeout 5 --max-time 15 "$url/dists/stable/Release" 2>/dev/null) || code=000
         if [ "$code" != "200" ]; then
-            info "跳过 $name (Release 不可用: HTTP $code)"
+            info "跳过 $name (Release HTTP $code)"
             continue
         fi
-        # 再测一次取较快值
-        t2="$(curl -s -o /dev/null -w '%{time_total}' \
-            --connect-timeout 4 --max-time 10 "$url/dists/stable/Release" 2>/dev/null || echo 999)"
-        t="$(printf '%s\n%s\n' "$t1" "$t2" | sort -n | head -1)"
-        info "测速 $name: ${t}s"
-        if awk "BEGIN{exit !($t < $best_t)}"; then
-            best_name="$name"; best_url="$url"; best_t="$t"
+        # 关键在于必须解析得出 Date —— 挡掉返回 HTML 却给 200 的假源
+        ts=$(release_ts "$work/rel") || {
+            info "跳过 $name (Release 里没有 Date 字段 —— 多半是个返回网页的假源)"
+            continue
+        }
+        age=$(( now - ts ))
+        if [ "$age" -gt "$MIRROR_MAX_AGE" ]; then
+            info "跳过 $name (同步于 $(( age / 86400 )) 天前, 太陈旧)"
+            continue
         fi
+        t1=$(curl -s -o /dev/null -w '%{time_total}' \
+            --connect-timeout 5 --max-time 15 "$url/dists/stable/Release" 2>/dev/null) || t1=999
+        t2=$(curl -s -o /dev/null -w '%{time_total}' \
+            --connect-timeout 5 --max-time 15 "$url/dists/stable/Release" 2>/dev/null) || t2=999
+        t=$(printf '%s\n%s\n' "$t1" "$t2" | sort -n | head -1)
+        info "候选 $name: ${t}s, 同步于 $(( age / 3600 )) 小时前"
+        [ "$ts" -gt "$newest" ] && newest=$ts
+        NAMES+=("$name"); URLS+=("$url"); TIMES+=("$t"); STAMPS+=("$ts")
+        n=$(( n + 1 ))
     done
 
-    if [ -z "$best_url" ]; then
+    if [ "$n" -eq 0 ]; then
         warn "所有候选源都不可用, 保持当前配置 (可手动: pkg change-repo)"
         return
     fi
-    ok "最快可用源: $best_name (${best_t}s)"
 
-    # 当前已是最快 → 不动
+    # 只保留"新鲜度落在宽限窗口内"的, 再从中选最快的
+    local best_name="" best_url="" best_t=999999 best_ts=0
+    cut=$(( newest - MIRROR_FRESH_GRACE ))
+    i=0
+    while [ "$i" -lt "$n" ]; do
+        if [ "${STAMPS[$i]}" -ge "$cut" ]; then
+            t="${TIMES[$i]}"
+            if [ -z "$best_url" ] || awk "BEGIN{exit !($t < $best_t)}"; then
+                best_name="${NAMES[$i]}"; best_url="${URLS[$i]}"; best_t="$t"; best_ts="${STAMPS[$i]}"
+            fi
+        fi
+        i=$(( i + 1 ))
+    done
+
+    if [ -z "$best_url" ]; then
+        warn "候选源的同步时间都超出宽限窗口, 保持当前配置"
+        return
+    fi
+    ok "选定源: $best_name (${best_t}s, 同步于 $(( (now - best_ts) / 3600 )) 小时前)"
+
+    # 当前已是选定源 → 不动
     if grep -qF "$best_url" "$sources_file" 2>/dev/null; then
-        ok "当前源已是最快, 无需切换"
+        ok "当前源已是选定源, 无需切换"
         return
     fi
 
@@ -185,16 +240,16 @@ fix_mirror() {
     cp "$sources_file" "$backup"
     warn "切换源: $(grep -oE 'https://[^ ]+' "$sources_file" | head -1) → $best_name"
     {
-        echo "# 由 install.sh 自动切换 (最快源: $best_name ${best_t}s)"
+        echo "# 由 install.sh 自动切换 (选定: $best_name ${best_t}s, Release $(( (now - best_ts) / 3600 )) 小时前)"
         echo "deb $best_url stable main"
     } > "$sources_file"
 
-    if DEBIAN_FRONTEND=noninteractive apt update -y; then
+    if DEBIAN_FRONTEND=noninteractive apt update -y >/dev/null 2>&1; then
         ok "apt update 成功 ($best_name), 原配置备份: $(basename "$backup")"
     else
         warn "apt update 失败, 已自动回滚到原配置"
         cp "$backup" "$sources_file"
-        DEBIAN_FRONTEND=noninteractive apt update -y || true
+        DEBIAN_FRONTEND=noninteractive apt update -y >/dev/null 2>&1 || true
     fi
 }
 
@@ -207,6 +262,7 @@ upgrade_packages() {
         warn "pkg upgrade 未完全成功, 请稍后重试 (pkg upgrade -y)"
     fi
 }
+
 
 # ---------- 证书修复 ----------
 fix_cert() {

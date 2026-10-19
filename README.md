@@ -61,7 +61,7 @@ bash <(curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/xkxxs/c
 | 步骤 | 说明 |
 |---|---|
 | 环境检查 | 仅支持 Termux + aarch64 |
-| 镜像源适配 | 对官方源 + 国内主流镜像（阿里/清华/中科大/腾讯/华为云）**逐个测速**，自动切换最快者（幂等，已最快则不动） |
+| 镜像源适配 | 对 官方/清华/中科大/阿里云/北大/南科大 逐个探测 + 测速，按**新鲜度优先、速度兜底**选源并自动切换（幂等，已是选定源则不动）。Release 落后最新超过 12 小时的源会被跳过——因为快的源不一定同步得勤（实测腾讯云曾落后 4 个月、包数差 178 个） |
 | 全量升级 | 换好源后 `pkg upgrade -y` 把所有软件包升到最新 |
 | 依赖安装 | `pkg install nodejs-lts patchelf sudo/proot`：有 root 装 sudo，无 root 自动装 proot（已装则跳过） |
 | 证书修复 | `SSL_CERT_FILE` 写入 `~/.bashrc`（musl 二进制不认识 Android CA 路径，否则 API 请求报 `stream disconnected`） |
