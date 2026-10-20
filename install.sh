@@ -164,6 +164,7 @@ fix_mirror() {
         "阿里云 https://mirrors.aliyun.com/termux/termux-main"
         "北大 https://mirrors.pku.edu.cn/termux/termux-main"
         "南科大 https://mirrors.sustech.edu.cn/termux/apt/termux-main"
+        "南阳理工 https://mirror.nyist.edu.cn/termux/apt/termux-main"
     )
 
     local work entry name url code ts age t1 t2 t i cut
