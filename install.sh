@@ -274,17 +274,34 @@ upgrade_packages() {
 }
 
 
+# ---------- shell rc (bash + zsh) ----------
+# 默认 shell 是 zsh 时不会读 ~/.bashrc, 只写 .bashrc 的 PATH / 环境变量等于没设。
+# 按 $SHELL / 已安装的 zsh / 已有的 .zshrc 判断, 两个 rc 文件都幂等写入。
+ensure_rc_line() {
+    local line="$1" pattern="$2" rc
+    local -a rcs=("$HOME_DIR/.bashrc")
+    if [ "$(basename "${SHELL:-bash}")" = "zsh" ] \
+       || [ -f "$HOME_DIR/.zshrc" ] \
+       || command -v zsh >/dev/null 2>&1; then
+        rcs+=("$HOME_DIR/.zshrc")
+    fi
+    for rc in "${rcs[@]}"; do
+        [ -e "$rc" ] || : > "$rc"
+        if ! grep -q "$pattern" "$rc" 2>/dev/null; then
+            printf '%s\n' "$line" >> "$rc"
+            info "已写入 $rc: $line"
+        fi
+    done
+}
+
 # ---------- 证书修复 ----------
 fix_cert() {
     if [ ! -f "$CERT_FILE" ]; then
         warn "未找到 CA 证书 ($CERT_FILE), 尝试安装 ca-certificates…"
         pkg install -y ca-certificates
     fi
-    # 写入 .bashrc (幂等)
-    if ! grep -q 'SSL_CERT_FILE' "$HOME_DIR/.bashrc" 2>/dev/null; then
-        echo "export SSL_CERT_FILE=$CERT_FILE" >> "$HOME_DIR/.bashrc"
-        info "SSL_CERT_FILE 已写入 ~/.bashrc"
-    fi
+    # 写入 shell rc (幂等; bash + zsh)
+    ensure_rc_line "export SSL_CERT_FILE=$CERT_FILE" 'SSL_CERT_FILE'
     export SSL_CERT_FILE="$CERT_FILE"
     ok "证书路径已设置: $CERT_FILE"
 }
@@ -803,11 +820,8 @@ esac
 WRAPPER_EOF
     chmod +x "$WRAPPER_PATH"
 
-    # 确保 ~/.local/bin 在 PATH 中且优先
-    if ! grep -q '\.local/bin' "$HOME_DIR/.bashrc" 2>/dev/null; then
-        echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME_DIR/.bashrc"
-        info "~/.local/bin 已加入 PATH (~/.bashrc)"
-    fi
+    # 确保 ~/.local/bin 在 PATH 中且优先 (bash + zsh)
+    ensure_rc_line 'export PATH="$HOME/.local/bin:$PATH"' '\.local/bin'
     ok "启动 wrapper 已生成: $WRAPPER_PATH"
 }
 

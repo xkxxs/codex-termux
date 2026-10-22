@@ -64,7 +64,7 @@ bash <(curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/xkxxs/c
 | 镜像源适配 | 对 官方/清华/中科大/阿里云/北大/南科大 逐个探测 + 测速，按**新鲜度优先、速度兜底**选源并自动切换（幂等，已是选定源则不动）。Release 落后最新超过 12 小时的源会被跳过——因为快的源不一定同步得勤（实测腾讯云曾落后 4 个月、包数差 178 个） |
 | 全量升级 | 换好源后 `pkg upgrade -y` 把所有软件包升到最新 |
 | 依赖安装 | `pkg install nodejs-lts patchelf sudo/proot`：有 root 装 sudo，无 root 自动装 proot（已装则跳过） |
-| 证书修复 | `SSL_CERT_FILE` 写入 `~/.bashrc`（musl 二进制不认识 Android CA 路径，否则 API 请求报 `stream disconnected`） |
+| 证书修复 | `SSL_CERT_FILE` 写入 `~/.bashrc`（默认 shell 为 zsh 时同时写入 `~/.zshrc`；musl 二进制不认识 Android CA 路径，否则 API 请求报 `stream disconnected`） |
 | **DNS 修复** | 安装独立的 `dns53` 组件到 `~/.local/share/dns53`（不属于任何 agent）；有 root：`dns53.js` 本地 DNS 转发器 + `.bashrc` 常驻（**自动优先手机当前 DNS，IPv4/IPv6 独立探测、缺失时公共 DNS 兜底；AAAA 默认屏蔽防境外 IPv6 卡死，境内 IPv6 可用时设 `DNS53_DISABLE_AAAA=0` 放开**）；无 root：`dns-bootstrap.js` 启动时实测校验候选 DNS 后写入 `resolv.conf` + proot 绑定。**Android 没有 `/etc/resolv.conf`**，musl 解析器回退 `127.0.0.1:53`（无人监听）→ 每次请求卡满 5s 超时，报 `error sending request`。两套方案都会校验应答质量并跳过被过滤的上游 |
 | 安装 Codex | `npm install -g @openai/codex@latest` + 手动解压 `-linux-arm64` tarball 到 vendor |
 | 生成 wrapper | `~/.local/bin/codex`：**启动前自动检查最新版，非最新自动更新再启动**（可 `CODEX_NO_AUTO_UPDATE=1` 跳过）、固定 `version.json` 防假升级循环、注入证书、自动拉起 dns53 组件、`codex update` 手动强制升级流程 |
