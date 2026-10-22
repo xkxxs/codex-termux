@@ -313,6 +313,8 @@ fix_cert() {
 #   bash ~/.local/share/dns53/install.sh
 DNS53_DIR="${XDG_DATA_HOME:-$HOME_DIR/.local/share}/dns53"
 DNS53_RAW_BASES=(
+    # gh-proxy 实时转发; jsDelivr 有约 12 小时缓存, 新提交可能暂时 404
+    "https://gh-proxy.com/https://raw.githubusercontent.com/xkxxs/codex-termux/main/dns53"
     "https://cdn.jsdelivr.net/gh/xkxxs/codex-termux@main/dns53"
     "https://raw.githubusercontent.com/xkxxs/codex-termux/main/dns53"
 )
