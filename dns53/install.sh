@@ -42,9 +42,19 @@ ver_gt() {
     [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$1" ]
 }
 
-# 删除旧版 .bashrc 钩子 (旧的无标记块 + 新的 marker 块), 其余内容原样保留
-strip_bashrc() {
-    local rc="$HOME/.bashrc"
+# bash + zsh 的 rc 文件 (zsh 不读 ~/.bashrc)
+shell_rcs() {
+    printf '%s\n' "$HOME/.bashrc"
+    if [ "$(basename "${SHELL:-bash}")" = "zsh" ] \
+       || [ -f "$HOME/.zshrc" ] \
+       || command -v zsh >/dev/null 2>&1; then
+        printf '%s\n' "$HOME/.zshrc"
+    fi
+}
+
+# 删除某个 rc 里的钩子 (旧的无标记块 + 新的 marker 块), 其余内容原样保留
+strip_rc() {
+    local rc="$1"
     [ -f "$rc" ] || return 0
     awk '
         /^# >>> dns53 >>>$/ {skip=1; next}
@@ -56,9 +66,15 @@ strip_bashrc() {
     mv "$rc.dns53.$$" "$rc"
 }
 
-write_bashrc() {
-    strip_bashrc
-    cat >> "$HOME/.bashrc" << 'BASHRC_EOF'
+strip_all_rcs() {
+    local rc
+    while IFS= read -r rc; do strip_rc "$rc"; done < <(shell_rcs)
+}
+
+write_rc() {
+    local rc="$1"
+    strip_rc "$rc"
+    cat >> "$rc" << 'BASHRC_EOF'
 
 # >>> dns53 >>>
 # 独立组件 (~/.local/share/dns53), 与任何 agent 目录无关; 删 agent 不会影响它
@@ -94,6 +110,14 @@ if [ -f "$DNS53_DIR/dns53.js" ] && [ -f "$DNS53_DIR/.root_mode" ]; then
 fi
 # <<< dns53 <<<
 BASHRC_EOF
+}
+
+write_all_rcs() {
+    local rc
+    while IFS= read -r rc; do
+        [ -e "$rc" ] || : > "$rc"
+        write_rc "$rc"
+    done < <(shell_rcs)
 }
 
 # 清理旧安装位置 (旧版把 dns53 放在 ~/.local/bin 和 ~/.codex)
@@ -161,7 +185,7 @@ show_status() {
 
 uninstall() {
     have_root && root_exec pkill -f '^node .*dns5[3]\.js' 2>/dev/null || true
-    strip_bashrc
+    strip_all_rcs
     migrate_legacy
     rm -rf "$DNS_DIR"
     ok "已卸载 dns53 (agent 目录未改动)"
@@ -170,7 +194,7 @@ uninstall() {
 activate() {
     migrate_legacy
     if have_root; then
-        write_bashrc
+        write_all_rcs
         # 旧安装的 dns53 可能仍从 ~/.local/bin 运行: 重启到新目录
         local cur
         cur="$(root_exec pgrep -af '^node .*dns5[3]\.js' 2>/dev/null || true)"
@@ -188,7 +212,7 @@ activate() {
         fi
         start_dns53
     else
-        strip_bashrc
+        strip_all_rcs
         info "无 root: 使用 dns-bootstrap 写 resolv.conf"
         node "$DNS_DIR/dns-bootstrap.js" || warn "dns-bootstrap 失败 (可稍后重试)"
     fi
