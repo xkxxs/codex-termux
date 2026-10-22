@@ -8,7 +8,6 @@
 const dgram = require('dgram');
 const fs = require('fs');
 const path = require('path');
-const { execFileSync } = require('child_process');
 
 // 公共兜底 DNS (手机 DNS 探测缺失时使用): IPv4 与 IPv6 各自独立
 const PUBLIC_DNS4 = [
@@ -22,6 +21,9 @@ const PUBLIC_DNS6 = [
   ['2408:8899::8', 53],   // 移动 IPv6
 ];
 const TIMEOUT_MS = 1500;
+// 单个上游等 250ms 没回就并行问下一个 (hedge): 国内 DNS 通常 <100ms,
+// 被墙/丢包的 8.8.8.8 要等满超时, 串行会卡 3-4 秒。
+const STAGGER_MS = 250;
 // AAAA 屏蔽开关 (默认开启): 屏蔽后客户端只走 IPv4,
 // 避免境外 IPv6 不可达导致连接卡死 (如 OpenAI 域名)。
 // 境内 IPv6 可用时, 可设 DNS53_DISABLE_AAAA=0 关闭屏蔽。
@@ -33,6 +35,11 @@ const scriptDir = (() => {
 })();
 const DNS_DIR = process.env.DNS53_DIR || scriptDir;
 const LOG = process.env.DNS53_LOG || `${DNS_DIR}/logs/dns53.log`;
+// 心跳: wrapper / check_dns 用它的 mtime 判断 dns53 是否活着,
+// 这样普通用户不用每次 su pgrep (避免授权弹窗), 也能在 dns53 挂掉时自动回退。
+const ALIVE = `${DNS_DIR}/.alive`;
+const beat = () => { try { fs.writeFileSync(ALIVE, String(Date.now())); } catch (_) {} };
+const clearAlive = () => { try { fs.unlinkSync(ALIVE); } catch (_) {} };
 const log = (m) => {
   try {
     fs.mkdirSync(path.dirname(LOG), { recursive: true });
@@ -58,46 +65,24 @@ let UPSTREAMS = [...PUBLIC_DNS4, ...PUBLIC_DNS6];
 function discoverPhoneDns() {
   const v4 = [];
   const v6 = [];
+  // 首选 bionic/netd 的当前服务器: 无子进程、无阻塞, 切网后 netd 会自动更新。
+  // (旧实现先跑 getprop / dumpsys connectivity 同步子进程, 最长阻塞 5s,
+  //  表现为每 60s 刷新时有一次查询卡 4 秒左右)
   try {
-    // 老版本 Android: getprop net.*.dnsN
-    const props = execFileSync('/system/bin/getprop', [], { encoding: 'utf8', timeout: 3000 });
-    for (const line of props.split('\n')) {
-      const m = line.match(/^\[net\.\S+\.dns\d+\]:\s*\[([0-9a-fA-F:.]+)\]/);
-      if (m) {
-        if (m[1].includes(':')) v6.push(m[1]); else v4.push(m[1]);
-      }
+    for (const ip of require('dns').getServers()) {
+      if (!ip) continue;
+      if (ip.includes(':')) v6.push(ip); else v4.push(ip);
     }
   } catch (_) {}
-  if (v4.length === 0 && v6.length === 0) {
-    try {
-      // 现代 Android: dumpsys connectivity 的 DnsAddresses。
-      // 优先默认网络 (TRANSPORT_PRIMARY), 再收集所有 INTERNET+VALIDATED 网络,
-      // 避免个别机型/网络下主网络块 DnsAddresses 为空时拿不到 DNS。
-      const out = execFileSync('/system/bin/dumpsys', ['connectivity'], { encoding: 'utf8', timeout: 5000 });
-      const blocks = out.split('NetworkAgentInfo{').slice(1);
-      const scored = [];
-      for (const b of blocks) {
-        const dm = b.match(/DnsAddresses:\s*\[([^\]]*)\]/);
-        if (!dm) continue;
-        const a4 = [];
-        const a6 = [];
-        for (const token of dm[1].split(/[\s,]+/)) {
-          const ip = token.replace(/^\//, '');
-          if (!ip) continue;
-          if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(ip)) a4.push(ip);
-          else if (/^[0-9a-fA-F:.]+$/.test(ip) && ip.includes(':')) a6.push(ip);
-        }
-        if (!a4.length && !a6.length) continue;
-        const score = (b.includes('TRANSPORT_PRIMARY') ? 0 : 1) + (b.includes('INTERNET') && b.includes('VALIDATED') ? 0 : 2);
-        scored.push([score, a4, a6]);
-      }
-      scored.sort((a, b) => a[0] - b[0]);
-      for (const [, a4, a6] of scored) {
-        v4.push(...a4);
-        v6.push(...a6);
-      }
-    } catch (_) {}
+  if (v4.length || v6.length) {
+    return {
+      v4: [...new Set(v4)].filter((ip) => ip !== '127.0.0.1' && ip !== '0.0.0.0'),
+      v6: [...new Set(v6)].filter((ip) => ip !== '::1' && ip !== '::'),
+    };
   }
+  // 不再用 getprop/dumpsys 同步兜底: root 下 getServers 可能为空, 而 dumpsys
+  // 会阻塞事件循环 3-5s (每 60s 刷新 → 查询卡顿)。拿不到手机 DNS 时,
+  // refreshDns 会退回 PUBLIC_DNS* 列表 (国内公共 DNS 在前)。
   return {
     v4: [...new Set(v4)].filter((ip) => ip !== '127.0.0.1' && ip !== '0.0.0.0'),
     v6: [...new Set(v6)].filter((ip) => ip !== '::1' && ip !== '::'),
@@ -336,10 +321,12 @@ server.on('message', (msg, rinfo) => {
     const tag = `q${qid}->${host}`;
     const sock = dgram.createSocket(host.includes(':') ? 'udp6' : 'udp4');
     let doneHere = false;
+    let hedge = null;
     const finish = (fn) => {
       if (doneHere) return;
       doneHere = true;
       clearTimeout(timer);
+      if (hedge) clearTimeout(hedge);
       sock.close();
       fn();
     };
@@ -355,6 +342,11 @@ server.on('message', (msg, rinfo) => {
       });
     };
     const timer = setTimeout(() => fail('timeout'), TIMEOUT_MS);
+    // 并行 hedge: 不等这个上游超时, 250ms 后同时问下一个, 先回先赢
+    hedge = setTimeout(() => {
+      if (doneHere || done) return;
+      tryNext();
+    }, STAGGER_MS);
     sock.on('message', (resp) => {
       if (doneHere) return;
       if (done) { finish(() => {}); return; }  // 防双发: 已有人先回过了
@@ -382,8 +374,15 @@ server.on('error', (e) => {
 });
 server.bind(53, '127.0.0.1', () => {
   refreshDns();
+  beat();
+  setInterval(beat, 20000);
   log('dns53 listening on 127.0.0.1:53');
   if (process.stdout.isTTY) console.log('dns53 listening on 127.0.0.1:53');
   setInterval(refreshDns, 60000);
 });
+
+process.on('exit', clearAlive);
+for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
+  process.on(sig, () => { clearAlive(); process.exit(0); });
+}
 

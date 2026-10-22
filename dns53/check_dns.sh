@@ -11,12 +11,19 @@ HOSTS=(api.deepseek.com api.anthropic.com opencode.ai www.baidu.com)
 echo "═══ 诊断 $(date '+%F %T') ═══"
 
 echo "── 模式 ──"
-if sudo -n true 2>/dev/null; then
-  echo "root: 可用 (dns53 方案)"
-  if sudo -n pgrep -f 'dns5[3]\.js' >/dev/null 2>&1; then
-    echo "dns53: 运行中"
+HAVE_ROOT=0
+if [ -f "$DNS_DIR/root.sh" ]; then
+  # shellcheck source=root.sh
+  . "$DNS_DIR/root.sh"
+  dns53_load_root_mode 0
+  dns53_have_root && HAVE_ROOT=1
+fi
+if [ "$HAVE_ROOT" = 1 ]; then
+  echo "root: 可用 (模式: $ROOT_MODE, dns53 方案)"
+  if dns53_alive; then
+    echo "dns53: 运行中 (心跳)"
   else
-    echo "dns53: ★ 未运行 (重开终端或: sudo nohup node $DNS_DIR/dns53.js &)"
+    echo "dns53: ★ 未运行 (重开终端, 或 bash $DNS_DIR/install.sh)"
   fi
   SRV=127.0.0.1
 else

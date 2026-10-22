@@ -102,16 +102,19 @@ check_environment() {
 # ---------- 依赖 ----------
 install_dependencies() {
     local need=()
+    # root 判定统一走 dns53 的 root.sh (direct/sudo/su); 安装时强制重新探测,
+    # 避免沿用上次遗留的 .root_mode (例如上次无 root、这次已是 root)
+    load_root_backend 1 >/dev/null 2>&1 || true
     command -v node >/dev/null || need+=(nodejs-lts)
     command -v npm >/dev/null || need+=(nodejs-lts)
     command -v patchelf >/dev/null || need+=(patchelf)
     # 有 root → dns53 原生方案; 无 root → proot 兜底 (wrapper 运行时自动选择)
-    if command -v sudo >/dev/null 2>&1; then
-        if ! sudo -n true 2>/dev/null; then
-            need+=(proot)
-        fi
+    # 有 root 也装 proot: dns53 挂掉时用它绑 resolv.conf, 否则原生执行无 DNS
+    if have_root; then
+        command -v proot >/dev/null 2>&1 || need+=(proot)
     else
-        need+=(sudo)
+        need+=(proot)
+        command -v sudo >/dev/null 2>&1 || need+=(sudo)
     fi
     if [ ${#need[@]} -gt 0 ]; then
         info "安装依赖: ${need[*]}"
@@ -119,8 +122,12 @@ install_dependencies() {
     else
         ok "依赖已就绪 (node $(node --version), patchelf)"
     fi
-    # sudo 刚装完再验证一次; 仍无 root 则补 proot
-    if ! sudo -n true 2>/dev/null; then
+    # 装完后再判定一次 (刚装的 sudo 可能已可用); 有 root 但缺 proot 时补装
+    load_root_backend 1 >/dev/null 2>&1 || true
+    if have_root; then
+        command -v proot >/dev/null 2>&1 \
+            || { info "安装 proot (dns53 不可用时的 DNS 兜底)…"; pkg install -y proot; }
+    else
         command -v proot >/dev/null 2>&1 || { info "未检测到 root, 安装 proot 兜底…"; pkg install -y proot; }
         warn "未检测到 root: 将使用 proot 兜底方案 (性能略降)"
     fi
@@ -292,7 +299,70 @@ DNS53_RAW_BASES=(
     "https://cdn.jsdelivr.net/gh/xkxxs/codex-termux@main/dns53"
     "https://raw.githubusercontent.com/xkxxs/codex-termux/main/dns53"
 )
-DNS53_FILES=(install.sh VERSION dns53.js dns-bootstrap.js dnsq.js check_dns.sh dns53-aaaa)
+DNS53_FILES=(install.sh VERSION root.sh dns53.js dns-bootstrap.js dnsq.js check_dns.sh dns53-aaaa)
+
+# ---------- root 探测 / 执行 ----------
+# Android 上有 root 不等于装了 Termux 的 sudo 包: Magisk/KernelSU 只提供 su,
+# 只认 `sudo -n` 会把这类设备误判成无 root。这里优先复用 dns53 组件的 root.sh
+# (探测顺序 direct → sudo -n → su -c, 结果缓存到 $DNS53_DIR/.root_mode),
+# 组件还没下载时用下面的等价内置实现。
+ROOT_HELPER=""
+ROOT_MODE=""
+
+load_root_backend() {
+    if [ -n "$ROOT_HELPER" ]; then
+        if [ "${1:-0}" = 1 ]; then dns53_load_root_mode 1; fi
+        return 0
+    fi
+    local f
+    for f in "${SCRIPT_DIR:+$SCRIPT_DIR/dns53/root.sh}" "$DNS53_DIR/root.sh"; do
+        [ -n "$f" ] && [ -f "$f" ] || continue
+        # shellcheck source=/dev/null
+        . "$f"
+        ROOT_HELPER="$f"
+        dns53_load_root_mode "${1:-0}"
+        return 0
+    done
+    return 1
+}
+
+# 内置探测 (仅在没有 root.sh 可用时): 与 dns53/root.sh 的探测顺序一致
+detect_root_mode() {
+    if [ "$(id -u 2>/dev/null)" = 0 ]; then echo direct; return 0; fi
+    if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then echo sudo; return 0; fi
+    if command -v su >/dev/null 2>&1; then
+        local u
+        u="$(timeout 5 su -c 'id -u' 2>/dev/null | tr -d '\r' | head -n 1 || true)"
+        if [ "$u" = 0 ]; then echo su; return 0; fi
+    fi
+    echo none
+}
+
+have_root() {
+    if load_root_backend 0; then
+        dns53_have_root
+        return
+    fi
+    [ "$(detect_root_mode)" != none ]
+}
+
+# 以 root 执行一条命令 (direct 直接跑 / sudo -n 不弹窗 / su -c 带转义)
+root_exec() {
+    if load_root_backend 0; then
+        dns53_root_exec "$@"
+        return
+    fi
+    case "$(detect_root_mode)" in
+        direct) "$@" ;;
+        sudo)   sudo -n "$@" ;;
+        su)
+            # Magisk/KernelSU 的 root shell PATH 可能不含 Termux 的 bin
+            local p="${PREFIX:-/data/data/com.termux/files/usr}/bin"
+            su -c "PATH=$p:/system/bin:/system/xbin:\$PATH $(printf '%q ' "$@")"
+            ;;
+        *)      return 1 ;;
+    esac
+}
 
 fetch_dns53_payload() {
     local dst="$1" base f all
@@ -354,23 +424,22 @@ fix_selinux_context() {
     [ -n "$ctx" ] || return 0
     mcs=$(printf '%s' "$ctx" | sed -n 's/.*\(:s[0-9][0-9]*.*\)$/\1/p')
     [ -n "$mcs" ] || return 0
-    command -v sudo >/dev/null 2>&1 || return 0
-    sudo -n true 2>/dev/null || return 0
+    have_root || return 0
 
     local fixed=0 p fctx target
     for p in "$PREFIX/bin/codex" "$CODEX_PKG_DIR"; do
         # 坏 context 的 symlink 无法被 unprivileged -e 探测, 先查 -L
         if [ ! -L "$p" ] && [ ! -e "$p" ]; then
-            sudo -n test -e "$p" 2>/dev/null || continue
+            root_exec test -e "$p" 2>/dev/null || continue
         fi
-        fctx=$(sudo -n stat -c '%C' "$p" 2>/dev/null || true)
+        fctx=$(root_exec stat -c '%C' "$p" 2>/dev/null || true)
         [ -n "$fctx" ] || continue
         target="${fctx%%:s*}${mcs}"
         [ "$fctx" != "$target" ] || continue
         if [ -L "$p" ]; then
-            sudo -n chcon -h "$target" "$p" 2>/dev/null && fixed=1
+            root_exec chcon -h "$target" "$p" 2>/dev/null && fixed=1
         else
-            sudo -n chcon -R "$target" "$p" 2>/dev/null && fixed=1
+            root_exec chcon -R "$target" "$p" 2>/dev/null && fixed=1
         fi
     done
     if [ "$fixed" = 1 ]; then
@@ -463,6 +532,44 @@ VENDOR_BIN="$PKG_DIR/vendor/aarch64-unknown-linux-musl/bin/codex"
 VERSION_FILE="$HOME/.codex/version.json"
 # dns53 独立组件 (与 agent 目录解耦)
 DNS53_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/dns53"
+
+# root 判定: 优先用 dns53 组件的 root.sh (direct → sudo -n → su -c,
+# 结果缓存到 $DNS53_DIR/.root_mode); 没有 root.sh 时退回内置探测。
+# Android 上 Magisk/KernelSU 只提供 su, 不能只认 Termux 的 sudo 包。
+if [ -f "$DNS53_DIR/root.sh" ]; then
+    . "$DNS53_DIR/root.sh"
+    dns53_load_root_mode 0
+fi
+
+have_root() {
+    if command -v dns53_have_root >/dev/null 2>&1; then
+        dns53_have_root
+        return
+    fi
+    [ "$(id -u 2>/dev/null)" = 0 ] && return 0
+    command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null && return 0
+    if command -v su >/dev/null 2>&1; then
+        local u
+        u="$(timeout 5 su -c 'id -u' 2>/dev/null | tr -d '\r' | head -n 1 || true)"
+        [ "$u" = 0 ] && return 0
+    fi
+    return 1
+}
+
+# 以 root 执行一条命令: dns53_root_exec (direct/sudo/su) 优先, 否则 sudo -n
+root_exec() {
+    if command -v dns53_root_exec >/dev/null 2>&1; then
+        dns53_root_exec "$@"
+        return
+    fi
+    have_root || return 1
+    if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+        sudo -n "$@"
+        return
+    fi
+    local p="${PREFIX:-/data/data/com.termux/files/usr}/bin"
+    su -c "PATH=$p:/system/bin:/system/xbin:\$PATH $(printf '%q ' "$@")"
+}
 
 # 本地实际版本 (如 0.147.0); 失败时为空
 current_version() {
@@ -560,21 +667,20 @@ fix_selinux_context() {
     [ -n "$ctx" ] || return 0
     mcs=$(printf '%s' "$ctx" | sed -n 's/.*\(:s[0-9][0-9]*.*\)$/\1/p')
     [ -n "$mcs" ] || return 0
-    command -v sudo >/dev/null 2>&1 || return 0
-    sudo -n true 2>/dev/null || return 0
+    have_root || return 0
     local fixed=0 p fctx target
     for p in /data/data/com.termux/files/usr/bin/codex "$PKG_DIR"; do
         if [ ! -L "$p" ] && [ ! -e "$p" ]; then
-            sudo -n test -e "$p" 2>/dev/null || continue
+            root_exec test -e "$p" 2>/dev/null || continue
         fi
-        fctx=$(sudo -n stat -c '%C' "$p" 2>/dev/null || true)
+        fctx=$(root_exec stat -c '%C' "$p" 2>/dev/null || true)
         [ -n "$fctx" ] || continue
         target="${fctx%%:s*}${mcs}"
         [ "$fctx" != "$target" ] || continue
         if [ -L "$p" ]; then
-            sudo -n chcon -h "$target" "$p" 2>/dev/null && fixed=1
+            root_exec chcon -h "$target" "$p" 2>/dev/null && fixed=1
         else
-            sudo -n chcon -R "$target" "$p" 2>/dev/null && fixed=1
+            root_exec chcon -R "$target" "$p" 2>/dev/null && fixed=1
         fi
     done
     [ "$fixed" = 1 ] && echo "→ 已修复 SELinux context (MCS 类别对齐)"
@@ -649,8 +755,31 @@ case "${1:-}" in
         fi
         RESOLV_CONF="${PREFIX:-/data/data/com.termux/files/usr}/etc/resolv.conf"
         # 有 root: 确保本地 DNS 转发器在跑 (见 README "DNS 修复")
+        #   有 root.sh → direct/sudo/su 探测 + dns53 心跳判断; dns53 起不来时
+        #   用 proot 绑 resolv.conf 兜底, 否则原生执行没有可用 DNS。
         # 无 root: dns-bootstrap 实测校验后 proot 绑定 resolv.conf
-        if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+        if [ -f "$DNS53_DIR/root.sh" ] && have_root; then
+            if ! dns53_alive && [ -f "$DNS53_DIR/dns53.js" ]; then
+                mkdir -p "$DNS53_DIR/logs"
+                dns53_root_exec nohup node "$DNS53_DIR/dns53.js" >> "$DNS53_DIR/logs/dns53.log" 2>&1 &
+                sleep 1
+            fi
+            if dns53_alive; then
+                exec node "$REAL_JS" "$@"
+            fi
+            # dns53 没起来: 有 proot 就绑 resolv.conf 兜底
+            if command -v proot >/dev/null 2>&1; then
+                [ -f "$RESOLV_CONF" ] || { echo "缺少 $RESOLV_CONF, 请重跑安装脚本" >&2; exit 1; }
+                if [ -f "$DNS53_DIR/dns-bootstrap.js" ]; then
+                    node "$DNS53_DIR/dns-bootstrap.js" \
+                        || echo "!! 网络 DNS 全部不可用 (UDP 53 被拦截?), 已用公共 DNS 兜底继续启动" >&2
+                fi
+                exec proot -b "$RESOLV_CONF:/etc/resolv.conf" node "$REAL_JS" "$@"
+            fi
+            echo "!! dns53 未运行且缺少 proot, 直接启动 (DNS 可能失效)" >&2
+            exec node "$REAL_JS" "$@"
+        elif [ ! -f "$DNS53_DIR/root.sh" ] && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+            # 旧安装 (无 root.sh): 保持原有 sudo -n 行为
             if ! sudo -n pgrep -f "dns5[3].js" > /dev/null 2>&1 && [ -f "$DNS53_DIR/dns53.js" ]; then
                 mkdir -p "$DNS53_DIR/logs"
                 sudo -n nohup node "$DNS53_DIR/dns53.js" >> "$DNS53_DIR/logs/dns53.log" 2>&1 &

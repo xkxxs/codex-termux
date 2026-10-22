@@ -15,17 +15,26 @@ DNS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/dns53"
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_DIR="$DNS_DIR/logs"
 SRC_VER="$(cat "$SELF_DIR/VERSION" 2>/dev/null || echo 0)"
-FILES=(install.sh VERSION dns53.js dns-bootstrap.js dnsq.js check_dns.sh dns53-aaaa)
+FILES=(install.sh VERSION root.sh dns53.js dns-bootstrap.js dnsq.js check_dns.sh dns53-aaaa)
 
 info() { printf '\033[36m▸ %s\033[0m\n' "$*"; }
 ok()   { printf '\033[32m✓ %s\033[0m\n' "$*"; }
 warn() { printf '\033[33m! %s\033[0m\n' "$*"; }
 fail() { printf '\033[31m✗ %s\033[0m\n' "$*"; exit 1; }
 
-have_root() { command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; }
+# ---- root 执行后端 ----------------------------------------------------------
+# 见 root.sh: 按 direct → sudo -n → su -c 探测并缓存到 $DNS_DIR/.root_mode
+# (Android 上 Magisk/KernelSU 只提供 su, 不能只认 Termux 的 sudo 包)
+[ -f "$SELF_DIR/root.sh" ] || fail "组件载荷不完整: 缺少 root.sh"
+# shellcheck source=root.sh
+. "$SELF_DIR/root.sh"
+
+have_root() { dns53_have_root; }
+root_exec() { dns53_root_exec "$@"; }
+load_root_mode() { dns53_load_root_mode "$@"; }
 
 is_running() {
-    have_root && sudo -n pgrep -f '^node .*dns5[3]\.js' >/dev/null 2>&1
+    dns53_alive
 }
 
 # $1 是否比 $2 新 (按版本号排序)
@@ -54,12 +63,34 @@ write_bashrc() {
 # >>> dns53 >>>
 # 独立组件 (~/.local/share/dns53), 与任何 agent 目录无关; 删 agent 不会影响它
 DNS53_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/dns53"
-if [ -f "$DNS53_DIR/dns53.js" ] && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-    if ! sudo -n pgrep -f '^node .*dns5[3]\.js' >/dev/null 2>&1; then
-        mkdir -p "$DNS53_DIR/logs"
-        sudo -n nohup node "$DNS53_DIR/dns53.js" >> "$DNS53_DIR/logs/dns53.log" 2>&1 &
-        sleep 1
+if [ -f "$DNS53_DIR/dns53.js" ] && [ -f "$DNS53_DIR/.root_mode" ]; then
+    _dns53_mode="$(cat "$DNS53_DIR/.root_mode" 2>/dev/null)"
+    # 心跳 120s 内 → 认为在跑, 不再 su pgrep (省掉每次开 shell 的授权提示)
+    _dns53_alive=0
+    if [ -f "$DNS53_DIR/.alive" ]; then
+        _dns53_mt=$(stat -c %Y "$DNS53_DIR/.alive" 2>/dev/null || echo 0)
+        [ $(( $(date +%s) - _dns53_mt )) -lt 120 ] && _dns53_alive=1
     fi
+    if [ "$_dns53_alive" = 0 ]; then
+        case "$_dns53_mode" in
+            su)
+                mkdir -p "$DNS53_DIR/logs"
+                ( su -c "PATH=${PREFIX:-/data/data/com.termux/files/usr}/bin:/system/bin:/system/xbin:\$PATH nohup node '$DNS53_DIR/dns53.js'" >> "$DNS53_DIR/logs/dns53.log" 2>&1 & )
+                sleep 1
+                ;;
+            direct)
+                mkdir -p "$DNS53_DIR/logs"
+                nohup node "$DNS53_DIR/dns53.js" >> "$DNS53_DIR/logs/dns53.log" 2>&1 &
+                sleep 1
+                ;;
+            sudo)
+                mkdir -p "$DNS53_DIR/logs"
+                sudo -n nohup node "$DNS53_DIR/dns53.js" >> "$DNS53_DIR/logs/dns53.log" 2>&1 &
+                sleep 1
+                ;;
+        esac
+    fi
+    unset _dns53_mode _dns53_alive _dns53_mt
 fi
 # <<< dns53 <<<
 BASHRC_EOF
@@ -91,7 +122,7 @@ install_files() {
         done
     fi
 
-    chmod 700 "$DNS_DIR"/*.js "$DNS_DIR/install.sh" "$DNS_DIR/dns53-aaaa" "$DNS_DIR/check_dns.sh"
+    chmod 700 "$DNS_DIR"/*.js "$DNS_DIR/install.sh" "$DNS_DIR/root.sh" "$DNS_DIR/dns53-aaaa" "$DNS_DIR/check_dns.sh"
     printf '%s\n' "$SRC_VER" > "$DNS_DIR/VERSION"
 }
 
@@ -101,7 +132,7 @@ start_dns53() {
         return 0
     fi
     mkdir -p "$LOG_DIR"
-    sudo -n nohup node "$DNS_DIR/dns53.js" >> "$LOG_DIR/dns53.log" 2>&1 &
+    root_exec nohup node "$DNS_DIR/dns53.js" >> "$LOG_DIR/dns53.log" 2>&1 &
     sleep 1
     if is_running; then
         ok "dns53 已启动 (127.0.0.1:53)"
@@ -114,9 +145,9 @@ show_status() {
     echo "目录: $DNS_DIR"
     echo "版本: $(cat "$DNS_DIR/VERSION" 2>/dev/null || echo 未安装)"
     if have_root; then
-        echo "root: 可用 (dns53 常驻方案)"
+        echo "root: 可用 (模式: $ROOT_MODE, dns53 常驻方案)"
         if is_running; then
-            echo "dns53: 运行中 (PID $(sudo -n pgrep -f '^node .*dns5[3]\.js' | head -1))"
+            echo "dns53: 运行中 (PID $(root_exec pgrep -f '^node .*dns5[3]\.js' | head -1))"
         else
             echo "dns53: ★ 未运行 (bash $DNS_DIR/install.sh 可拉起)"
         fi
@@ -129,7 +160,7 @@ show_status() {
 }
 
 uninstall() {
-    have_root && sudo -n pkill -f '^node .*dns5[3]\.js' 2>/dev/null || true
+    have_root && root_exec pkill -f '^node .*dns5[3]\.js' 2>/dev/null || true
     strip_bashrc
     migrate_legacy
     rm -rf "$DNS_DIR"
@@ -142,10 +173,17 @@ activate() {
         write_bashrc
         # 旧安装的 dns53 可能仍从 ~/.local/bin 运行: 重启到新目录
         local cur
-        cur="$(sudo -n pgrep -af '^node .*dns5[3]\.js' 2>/dev/null || true)"
+        cur="$(root_exec pgrep -af '^node .*dns5[3]\.js' 2>/dev/null || true)"
         if [ -n "$cur" ] && ! printf '%s\n' "$cur" | grep -qF "$DNS_DIR/dns53.js"; then
             info "检测到旧路径的 dns53, 重启以切换到独立目录"
-            sudo -n pkill -f '^node .*dns5[3]\.js' 2>/dev/null || true
+            root_exec pkill -f '^node .*dns5[3]\.js' 2>/dev/null || true
+            sleep 1
+        fi
+        # 2.2.0 之前没有心跳文件: 进程在跑但 .alive 缺失/过期 → 重启加载新代码,
+        # 否则 start_dns53 会因 53 端口被占而启动失败, 旧进程继续跑且没有心跳。
+        if ! is_running && root_exec pgrep -f '^node .*dns5[3]\.js' >/dev/null 2>&1; then
+            info "检测到旧版本 dns53 (无心跳), 重启以加载新代码"
+            root_exec pkill -f '^node .*dns5[3]\.js' 2>/dev/null || true
             sleep 1
         fi
         start_dns53
@@ -159,10 +197,10 @@ activate() {
 
 main() {
     case "${1:-install}" in
-        --status)    show_status ;;
-        --uninstall) uninstall ;;
-        --force)     install_files 1; activate ;;
-        install|--install) install_files 0; activate ;;
+        --status)    load_root_mode 1; show_status ;;
+        --uninstall) load_root_mode 0; uninstall ;;
+        --force)     install_files 1; load_root_mode 1; activate ;;
+        install|--install) install_files 0; load_root_mode 1; activate ;;
         *) fail "用法: bash install.sh [--force|--status|--uninstall]" ;;
     esac
 }

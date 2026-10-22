@@ -8,8 +8,13 @@ D53="$DNS_DIR/dns53.js"
 LOG="$DNS_DIR/logs/dns53.log"
 mkdir -p "$DNS_DIR/logs"
 
+[ -f "$DNS_DIR/root.sh" ] || { echo "缺少 $DNS_DIR/root.sh, 请重跑 dns53 安装器" >&2; exit 1; }
+# shellcheck source=root.sh
+. "$DNS_DIR/root.sh"
+dns53_load_root_mode 0
+
 get_pid() {
-  sudo -n pgrep -f '^node .*dns5[3]\.js' 2>/dev/null | head -1
+  dns53_root_exec pgrep -f '^node .*dns5[3]\.js' 2>/dev/null | head -1 || true
 }
 
 show_status() {
@@ -19,7 +24,7 @@ show_status() {
     echo "dns53 未运行"
     return
   fi
-  mode=$(sudo -n cat "/proc/$pid/environ" 2>/dev/null | tr '\0' '\n' | sed -n 's/^DNS53_DISABLE_AAAA=//p')
+  mode=$(dns53_root_exec cat "/proc/$pid/environ" 2>/dev/null | tr '\0' '\n' | sed -n 's/^DNS53_DISABLE_AAAA=//p' || true)
   if [ "$mode" = "0" ]; then
     echo "关闭（放行 AAAA/IPv6）| PID $pid"
   else
@@ -29,9 +34,13 @@ show_status() {
 
 restart() {
   local val="$1" label="$2"
-  sudo -n pkill -f '^node .*dns5[3]\.js' 2>/dev/null || true
+  if ! dns53_have_root; then
+    echo "当前无 root (模式: ${ROOT_MODE:-none}), 无法重启 dns53" >&2
+    return 1
+  fi
+  dns53_root_exec pkill -f '^node .*dns5[3]\.js' 2>/dev/null || true
   sleep 1
-  sudo -n env DNS53_DISABLE_AAAA="$val" nohup node "$D53" > "$LOG" 2>&1 &
+  dns53_root_exec env DNS53_DISABLE_AAAA="$val" nohup node "$D53" > "$LOG" 2>&1 &
   sleep 1
   echo "✓ $label"
   show_status
