@@ -40,7 +40,7 @@
 
 ## 一行命令安装
 
-优先用 gh-proxy（实时转发，不走 CDN 缓存）；拉不动时依次换 jsDelivr（约 12 小时缓存）或 GitHub 直连：
+优先用 gh-proxy（缓存约几分钟）；拉不动时依次换 jsDelivr（约 12 小时缓存）或 GitHub 直连（实时，但国内网络不稳定）：
 
 ```bash
 # 推荐: gh-proxy
