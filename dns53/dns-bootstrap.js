@@ -36,6 +36,15 @@ const log = (m) => {
 // 探测手机当前网络 DNS (与 dns53 同一套逻辑, 无 root 也能跑 dumpsys)
 function discoverPhoneDns() {
   const servers = [];
+  // 首选 bionic/netd 的当前服务器: 无子进程、无阻塞 (getprop/dumpsys 会卡 3-5s)。
+  try {
+    for (const ip of require('dns').getServers()) {
+      if (ip && !ip.includes(':')) servers.push(ip);
+    }
+  } catch (_) {}
+  if (servers.length) {
+    return [...new Set(servers)].filter((ip) => ip !== '127.0.0.1' && ip !== '0.0.0.0');
+  }
   try {
     const props = execFileSync('/system/bin/getprop', [], { encoding: 'utf8', timeout: 3000 });
     for (const line of props.split('\n')) {
