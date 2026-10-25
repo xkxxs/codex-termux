@@ -871,6 +871,8 @@ show_guide() {
     echo "    codex                  启动"
     echo "    codex update           更新到最新版"
     echo "    重跑本脚本即更新        (bash <(curl -fsSL …/install.sh))"
+    echo "  安装完成后请退出 Termux 重新打开 (或新开一个会话), 让 PATH 生效。"
+    echo
     echo "  建议的 Android 设置 (防止 Termux 被系统杀后台):"
     echo "    1. 开发者选项 → 停止限制子进程: 开启"
     echo "    2. 系统设置 → 应用 → Termux → 电池: 不优化"

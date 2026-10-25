@@ -55,6 +55,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/xkxxs/codex-termux/main/inst
 
 > 有 root / 无 root 都能装：有 root 走 dns53 原生直跑，无 root 自动用 proot 兜底（见[前置要求](#前置要求)）。
 
+> **安装完成后请退出 Termux 并重新打开，或新开一个会话**，让 PATH 和环境变量生效。
+
 ## 后台保活建议
 
 Android 可能在息屏后杀掉 Termux 进程，导致长任务中断。装完后建议做三件事（不同 ROM 的名称/路径略有差异）：
